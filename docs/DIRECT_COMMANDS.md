@@ -79,13 +79,14 @@ The file contains these sections:
 
 - `CFS_DIRECT_CONFIG`: configuration-only macro holding XY coordinates,
   minimum travel Z, Z-hop, speeds, distances, stage polling, purge length,
-  sensor name, and homing command.
+  bucket-exit wipe tuning, sensor name, and homing command.
 - `CFS_DIRECT_TOOLCHANGE`: public entry point.
 - `_CFS_DIRECT_SEQUENCE`: post-home safe-Z calculation and workflow dispatch.
 - `_CFS_DIRECT_UNLOAD`: buffer-aware pre-cut retract, cutter movement, and
   material-triggered unload.
 - `_CFS_DIRECT_LOAD`: explicit connection, tension, stages 0/4/5/6/7,
-  toolhead handoff, optional purge, and print mode.
+  toolhead handoff, optional purge, print mode, and a high-acceleration
+  outside-inside-final-out bucket exit.
 - `_CFS_DIRECT_FINISH`: post-load sensor check and active-slot persistence.
 
 `CFS_DIRECT_CONFIG` ships with every movement coordinate and `minimum_z` set
@@ -118,10 +119,20 @@ Call the workflow directly while commissioning it:
 CFS_DIRECT_TOOLCHANGE FROM=A TO=B TEMP=220 PURGE=40
 ```
 
+To unload without loading another slot, omit `TO`:
+
+```gcode
+CFS_DIRECT_TOOLCHANGE FROM=A TEMP=220
+```
+
+Unload-only mode clears the saved `cfs_active_slot` after the unload finishes.
+It does not require calibrated extrude/bucket coordinates.
+
 `FROM` may be omitted after the first successful change; the confirmed active
-slot is saved as `cfs_active_slot`. `TEMP` is used when the hotend is too cold
-for either retract or load extrusion. `PURGE` overrides the configured purge
-length for one change.
+slot is saved as `cfs_active_slot`. A positive `TEMP` always sets and waits for
+that exact hotend target before both unload and load, even when the hotend is
+already above its cold-extrusion threshold. `PURGE` overrides the configured
+purge length for one change.
 
 `macros/direct_tool_aliases.cfg` optionally maps `T0` through `T3` to slots A
 through D. Do not include it if another file already defines those commands.

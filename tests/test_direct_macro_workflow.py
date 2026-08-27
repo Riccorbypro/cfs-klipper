@@ -39,12 +39,17 @@ def test_direct_load_renders_named_stages_and_configured_poll_count():
         handoff_speed=12000.0,
         purge_length=0.0,
         purge_speed=500.0,
+        purge_wipe_accel=15000.0,
+        purge_wipe_speed=12000.0,
+        purge_wipe_repetitions=3,
+        retreat_y=200.0,
     )
     rendered = template.render(
         params={"TO": "C", "SAFE_Z": "82.0"},
         printer={
             "gcode_macro CFS_DIRECT_CONFIG": config,
             "extruder": SimpleNamespace(can_extrude=True),
+            "toolhead": SimpleNamespace(max_accel=3000.0),
         },
         action_raise_error=lambda message: "ERROR %s" % message,
         action_respond_info=lambda message: "INFO %s" % message,
@@ -56,6 +61,113 @@ def test_direct_load_renders_named_stages_and_configured_poll_count():
     assert rendered.count("_BOX_EXTRUDE_PROCESS SLOT=C STAGE=5 AMOUNT=0") == 3
     assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=7 AMOUNT=3" in rendered
     assert "_BOX_SET_BOX_MODE SLOT=C MODE=PRINT" in rendered
+
+
+def test_direct_load_heats_to_requested_temperature_when_already_hot():
+    """A printable hotend must still wait for the requested material temperature."""
+    template = _load_template("gcode_macro _CFS_DIRECT_LOAD")
+    config = SimpleNamespace(
+        extrude_x=159.0,
+        extrude_y=217.5,
+        retreat_y=200.0,
+        travel_speed=1500.0,
+        extrude_poll_count=3,
+        poll_delay_ms=400,
+        prime_e1=10.0,
+        prime_e1_speed=35.0,
+        prime_e2=5.0,
+        prime_e2_speed=10.0,
+        handoff_push=9.0,
+        handoff_speed=12000.0,
+        purge_length=0.0,
+        purge_speed=500.0,
+        purge_wipe_accel=15000.0,
+        purge_wipe_speed=12000.0,
+        purge_wipe_repetitions=3,
+    )
+    rendered = template.render(
+        params={"TO": "C", "TEMP": "260", "SAFE_Z": "82.0"},
+        printer={
+            "gcode_macro CFS_DIRECT_CONFIG": config,
+            "extruder": SimpleNamespace(can_extrude=True),
+            "toolhead": SimpleNamespace(max_accel=3000.0),
+        },
+        action_raise_error=lambda message: "ERROR %s" % message,
+        action_respond_info=lambda message: "INFO %s" % message,
+    )
+
+    assert "M109 S260.0" in rendered
+
+
+def test_direct_unload_heats_to_requested_temperature_when_already_hot():
+    """Unload must not treat the cold-extrusion threshold as its final target."""
+    template = _load_template("gcode_macro _CFS_DIRECT_UNLOAD")
+    config = SimpleNamespace(
+        pre_cut_retract=27.0,
+        buffer_chunk=20.0,
+        pre_cut_retract_speed=1980.0,
+        cut_x=36.0,
+        cut_y=227.0,
+        retreat_x=36.0,
+        retreat_y=200.0,
+        travel_speed=1500.0,
+        cut_speed=1200.0,
+        cut_repetitions=2,
+        post_cut_retract=60.0,
+        post_cut_retract_speed=500.0,
+    )
+    rendered = template.render(
+        params={"FROM": "A", "TEMP": "260", "SAFE_Z": "52.0"},
+        printer={
+            "gcode_macro CFS_DIRECT_CONFIG": config,
+            "extruder": SimpleNamespace(can_extrude=True),
+        },
+        action_raise_error=lambda message: "ERROR %s" % message,
+        action_respond_info=lambda message: "INFO %s" % message,
+    )
+
+    assert "M109 S260.0" in rendered
+
+
+def test_direct_load_uses_choreographed_bucket_exit_and_restores_acceleration():
+    """Loading must finish with the high-acceleration wipe outside the bucket."""
+    template = _load_template("gcode_macro _CFS_DIRECT_LOAD")
+    config = SimpleNamespace(
+        extrude_x=159.0,
+        extrude_y=217.5,
+        retreat_y=200.0,
+        travel_speed=1500.0,
+        extrude_poll_count=1,
+        poll_delay_ms=400,
+        prime_e1=10.0,
+        prime_e1_speed=35.0,
+        prime_e2=5.0,
+        prime_e2_speed=10.0,
+        handoff_push=9.0,
+        handoff_speed=12000.0,
+        purge_length=0.0,
+        purge_speed=500.0,
+        purge_wipe_accel=15000.0,
+        purge_wipe_speed=12000.0,
+        purge_wipe_repetitions=3,
+    )
+    rendered = template.render(
+        params={"TO": "C", "TEMP": "260", "SAFE_Z": "82.0"},
+        printer={
+            "gcode_macro CFS_DIRECT_CONFIG": config,
+            "extruder": SimpleNamespace(can_extrude=True),
+            "toolhead": SimpleNamespace(max_accel=3000.0),
+        },
+        action_raise_error=lambda message: "ERROR %s" % message,
+        action_respond_info=lambda message: "INFO %s" % message,
+    )
+
+    assert "SET_VELOCITY_LIMIT ACCEL=15000.0" in rendered
+    assert rendered.count("G1 X159.0 Y200.0 F12000.0") == 4
+    assert rendered.count("G1 X159.0 Y217.5 F12000.0") == 3
+    assert rendered.index("G1 X159.0 Y217.5 F12000.0") < rendered.rindex(
+        "G1 X159.0 Y200.0 F12000.0")
+    assert "SET_VELOCITY_LIMIT ACCEL=3000.0" in rendered
 
 
 def test_direct_toolchange_rejects_uncalibrated_motion_coordinates():
@@ -87,6 +199,62 @@ def test_direct_toolchange_rejects_uncalibrated_motion_coordinates():
     assert "_CFS_DIRECT_SEQUENCE" not in rendered
 
 
+def test_direct_toolchange_accepts_from_only_and_clears_active_slot():
+    """An unload-only request must not require or finish a subsequent load."""
+    template = _load_template("gcode_macro CFS_DIRECT_TOOLCHANGE")
+    config = SimpleNamespace(
+        cut_x=36.0,
+        cut_y=227.0,
+        retreat_x=36.0,
+        retreat_y=200.0,
+        extrude_x=-1.0,
+        extrude_y=-1.0,
+        minimum_z=50.0,
+        purge_length=0.0,
+        home_command="G28",
+    )
+    rendered = template.render(
+        params={"FROM": "A", "TEMP": "260"},
+        printer={
+            "gcode_macro CFS_DIRECT_CONFIG": config,
+            "save_variables": SimpleNamespace(
+                variables={"cfs_active_slot": "A"}),
+            "toolhead": SimpleNamespace(homed_axes="xyz"),
+        },
+        action_raise_error=lambda message: "ERROR %s" % message,
+        action_respond_info=lambda message: "INFO %s" % message,
+    )
+
+    assert "_CFS_DIRECT_SEQUENCE FROM=A TEMP=260 PURGE=0.0" in rendered
+    assert "_CFS_DIRECT_FINISH" not in rendered
+    assert "SAVE_VARIABLE VARIABLE=cfs_active_slot VALUE='\"\"'" in rendered
+
+
+def test_direct_sequence_skips_load_when_to_slot_is_omitted():
+    """The post-home dispatcher must stop after unloading in FROM-only mode."""
+    template = _load_template("gcode_macro _CFS_DIRECT_SEQUENCE")
+    config = SimpleNamespace(
+        minimum_z=50.0,
+        z_hop=2.0,
+        purge_length=0.0,
+    )
+    rendered = template.render(
+        params={"FROM": "A", "TEMP": "260"},
+        printer={
+            "gcode_macro CFS_DIRECT_CONFIG": config,
+            "toolhead": SimpleNamespace(position=SimpleNamespace(z=10.0)),
+            "configfile": SimpleNamespace(
+                settings=SimpleNamespace(
+                    stepper_z=SimpleNamespace(position_max=250.0))),
+        },
+        action_raise_error=lambda message: "ERROR %s" % message,
+        action_respond_info=lambda message: "INFO %s" % message,
+    )
+
+    assert "_CFS_DIRECT_UNLOAD FROM=A TEMP=260 SAFE_Z=52.0" in rendered
+    assert "_CFS_DIRECT_LOAD" not in rendered
+
+
 def test_direct_load_stops_before_box_motion_when_hotend_is_cold():
     """A first load must not start CFS motors before cold extrusion is rejected."""
     template = _load_template("gcode_macro _CFS_DIRECT_LOAD")
@@ -104,6 +272,10 @@ def test_direct_load_stops_before_box_motion_when_hotend_is_cold():
         handoff_speed=12000.0,
         purge_length=0.0,
         purge_speed=500.0,
+        purge_wipe_accel=15000.0,
+        purge_wipe_speed=12000.0,
+        purge_wipe_repetitions=3,
+        retreat_y=200.0,
     )
     rendered = template.render(
         params={"TO": "A", "TEMP": "0", "SAFE_Z": "52.0"},
@@ -132,6 +304,7 @@ def test_direct_unload_rejects_non_positive_buffer_chunk():
         retreat_y=200.0,
         travel_speed=1500.0,
         cut_speed=1200.0,
+        cut_repetitions=2,
         post_cut_retract=60.0,
         post_cut_retract_speed=500.0,
     )
