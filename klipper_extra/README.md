@@ -90,6 +90,15 @@ then test read-only first:
 CFS_STATUS
 ```
 
+For a lower-level, box.cfg-style workflow, this extra also registers hidden
+underscore-prefixed `_BOX_*` commands with typed parameters for individual
+box-mode, sensor, motor, preloading, staged extrude/retrude, measuring-wheel,
+and raw-data operations. They translate the upstream-style command surface to
+this repository's different, live-validated function IDs and F7/CRC8 framing.
+See [`docs/DIRECT_COMMANDS.md`](../docs/DIRECT_COMMANDS.md) for the full command
+reference and the separately installable `macros/direct_toolchange.cfg`
+workflow. Existing `CFS_RETRUDE` and `CFS_EXTRUDE` behavior is unchanged.
+
 If it says "not addressed" (e.g. a genuinely first-ever run with a fresh
 box), try `CFS_RECONNECT`, which now falls back to full broadcast
 discovery automatically. Only move on to `CFS_RETRUDE SLOT=A` /

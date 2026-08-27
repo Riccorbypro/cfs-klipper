@@ -304,6 +304,13 @@ printer** (none run even once yet, clearly marked as such in each file):
 - [`macros/tool_aliases_draft.cfg`](macros/tool_aliases_draft.cfg) — wires
   `T0`-`T3` to `CFS_TOOLCHANGE` + `CFS_FLUSH` for eventual slicer use, once
   both of those are independently trusted by hand first.
+- [`macros/direct_toolchange.cfg`](macros/direct_toolchange.cfg) — a
+  configurable `box.cfg`-style workflow using hidden, typed `_BOX_*` direct
+  commands instead of the wrapped process commands. Read
+  [`docs/DIRECT_COMMANDS.md`](docs/DIRECT_COMMANDS.md) before installation.
+- [`macros/direct_tool_aliases.cfg`](macros/direct_tool_aliases.cfg) — optional
+  `T0`-`T3` aliases for the direct workflow; do not load it alongside another
+  tool-alias file.
 
 [`docs/TOOLCHANGE_TEST_PLAN.md`](docs/TOOLCHANGE_TEST_PLAN.md) has the
 full staged, supervised order to test all of this in — individual pieces,
