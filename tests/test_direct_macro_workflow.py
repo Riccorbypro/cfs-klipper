@@ -50,12 +50,12 @@ def test_direct_load_renders_named_stages_and_configured_poll_count():
         action_respond_info=lambda message: "INFO %s" % message,
     )
 
-    assert "_BOX_EXTRUDE_PROCESS NUM=C STAGE=0 AMOUNT=0" in rendered
+    assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=0 AMOUNT=0" in rendered
     assert "G1 Z82.0 F1500.0" in rendered
-    assert "_BOX_EXTRUDE_PROCESS NUM=C STAGE=4 AMOUNT=0" in rendered
-    assert rendered.count("_BOX_EXTRUDE_PROCESS NUM=C STAGE=5 AMOUNT=0") == 3
-    assert "_BOX_EXTRUDE_PROCESS NUM=C STAGE=7 AMOUNT=3" in rendered
-    assert "_BOX_SET_BOX_MODE NUM=C MODE=PRINT" in rendered
+    assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=4 AMOUNT=0" in rendered
+    assert rendered.count("_BOX_EXTRUDE_PROCESS SLOT=C STAGE=5 AMOUNT=0") == 3
+    assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=7 AMOUNT=3" in rendered
+    assert "_BOX_SET_BOX_MODE SLOT=C MODE=PRINT" in rendered
 
 
 def test_direct_toolchange_rejects_uncalibrated_motion_coordinates():

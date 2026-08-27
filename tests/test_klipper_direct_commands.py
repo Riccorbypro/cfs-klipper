@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import os
 import struct
 import sys
+from contextlib import nullcontext
 
 import pytest
 
@@ -169,17 +170,21 @@ def test_hidden_box_commands_are_registered_without_public_aliases(direct_api):
 @pytest.mark.parametrize(
     "command,params,want_fn,want_data,want_timeout",
     [
-        ("_BOX_SET_BOX_MODE", {"ADDR": 2, "NUM": "B", "MODE": "PRINT"},
+        ("_BOX_GET_RFID", {"SLOT": "A"},
+         "GET_RFID", b"\x01", 2.0),
+        ("_BOX_GET_REMAIN_LEN", {"SLOT": "D"},
+         "GET_REMAIN_LEN", b"\x08", 2.0),
+        ("_BOX_SET_BOX_MODE", {"ADDR": 2, "SLOT": "B", "MODE": "PRINT"},
          "SET_BOX_MODE", b"\x02\x00", 2.0),
-        ("_BOX_SET_PRE_LOADING", {"NUM": 15, "ACTION": "OPEN"},
-         "SET_PRE_LOADING", b"\x0f\x01", 2.0),
+        ("_BOX_SET_PRE_LOADING", {"SLOT": "D", "ACTION": "OPEN"},
+         "SET_PRE_LOADING", b"\x08\x01", 2.0),
         ("_BOX_CTRL_CONNECTION_MOTOR_ACTION", {"ACTION": "RETRUDE"},
          "CTRL_CONNECTION_MOTOR_ACTION", b"\x02", 2.0),
         ("_BOX_TIGHTEN_UP_ENABLE", {"ENABLE": "ENABLE"},
          "TIGHTEN_UP_ENABLE", b"\x01", 2.0),
-        ("_BOX_EXTRUDE_PROCESS", {"NUM": "C", "STAGE": 7, "AMOUNT": 3},
+        ("_BOX_EXTRUDE_PROCESS", {"SLOT": "C", "STAGE": 7, "AMOUNT": 3},
          "EXTRUDE_PROCESS", b"\x04\x07\x03", 2.0),
-        ("_BOX_RETRUDE_PROCESS", {"NUM": "D", "TRIGGER": "MATERIAL"},
+        ("_BOX_RETRUDE_PROCESS", {"SLOT": "D", "TRIGGER": "MATERIAL"},
          "RETRUDE_PROCESS", b"\x08\x01", 2.0),
         ("_BOX_MOVE_DISTANCE", {"DIRECTION": "RETRUDE", "DIST": 50},
          "MOVE_DISTANCE", b"\x01\x32", 2.0),
@@ -198,8 +203,28 @@ def test_named_parameters_translate_to_validated_local_payloads(
 def test_stage_seven_defaults_to_hardware_validated_amount(direct_api):
     """Omitting AMOUNT at stage 7 must not restore the known-wrong zero byte."""
     _, commands, calls = direct_api
-    commands["_BOX_EXTRUDE_PROCESS"](FakeGcmd(NUM="A", STAGE=7))
+    commands["_BOX_EXTRUDE_PROCESS"](FakeGcmd(SLOT="A", STAGE=7))
     assert calls[-1][3] == b"\x01\x07\x03"
+
+
+@pytest.mark.parametrize(
+    "command,params",
+    [
+        ("_BOX_GET_RFID", {"NUM": 1}),
+        ("_BOX_GET_REMAIN_LEN", {"NUM": 1}),
+        ("_BOX_SET_BOX_MODE", {"NUM": "A", "MODE": "PRINT"}),
+        ("_BOX_SET_PRE_LOADING", {"NUM": 1, "ACTION": "OPEN"}),
+        ("_BOX_EXTRUDE_PROCESS", {"NUM": "A", "STAGE": 0}),
+        ("_BOX_RETRUDE_PROCESS", {"NUM": "A"}),
+    ],
+)
+def test_legacy_num_parameter_is_rejected_without_serial_write(
+        direct_api, command, params):
+    """Accepting NUM could silently target a different slot after the rename."""
+    _, commands, calls = direct_api
+    with pytest.raises(ValueError, match="SLOT"):
+        commands[command](FakeGcmd(**params))
+    assert calls == []
 
 
 def test_read_commands_decode_known_response_fields(direct_api):
@@ -230,9 +255,9 @@ def test_raw_sender_accepts_separated_hex_bytes_without_decimal_digit_splitting(
 @pytest.mark.parametrize(
     "command,params,message",
     [
-        ("_BOX_SET_BOX_MODE", {"NUM": "E", "MODE": "PRINT"}, "NUM"),
-        ("_BOX_EXTRUDE_PROCESS", {"NUM": "A", "STAGE": 8}, "STAGE"),
-        ("_BOX_RETRUDE_PROCESS", {"NUM": "A", "TRIGGER": "NOPE"}, "TRIGGER"),
+        ("_BOX_SET_BOX_MODE", {"SLOT": "E", "MODE": "PRINT"}, "SLOT"),
+        ("_BOX_EXTRUDE_PROCESS", {"SLOT": "A", "STAGE": 8}, "STAGE"),
+        ("_BOX_RETRUDE_PROCESS", {"SLOT": "A", "TRIGGER": "NOPE"}, "TRIGGER"),
         ("_BOX_SEND_DATA", {"CMD": 13, "DATA": "abc"}, "DATA"),
     ],
 )

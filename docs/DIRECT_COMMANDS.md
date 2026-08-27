@@ -2,16 +2,18 @@
 
 This repository exposes a hidden, low-level G-code surface for users who want
 to build their own CFS process instead of relying on the wrapped `CFS_EXTRUDE`
-and `CFS_RETRUDE` commands. The command names and named parameters follow the
-shape documented by FrederickAlt's
+and `CFS_RETRUDE` commands. The command names follow the shape documented by
+FrederickAlt's
 [`serial-protocol.md`](https://github.com/FrederickAlt/CREALITY-K1-AND-K1-MAX-CFS-RETRUDE-BEFORE-CUT-MOD/blob/master/docs/serial-protocol.md),
-while `macros/direct_toolchange.cfg` provides a configurable workflow parallel
-to that project's
+but slot-selecting parameters consistently use `SLOT=A|B|C|D` in this
+repository. `macros/direct_toolchange.cfg` provides a configurable workflow
+parallel to that project's
 [`box.cfg`](https://github.com/FrederickAlt/CREALITY-K1-AND-K1-MAX-CFS-RETRUDE-BEFORE-CUT-MOD/blob/master/box.cfg).
 
 ## Compatibility boundary
 
-Compatibility is at the G-code parameter level, not the raw byte level.
+Compatibility is at the command-intent level, not exact parameter spelling or
+the raw byte level.
 
 The referenced `serial_485` wrapper describes application packets beginning
 with `ADDR`, and command IDs such as `GET_BOX_STATE=0x09`. This repository's
@@ -42,17 +44,17 @@ and the console.
 |---|---|---|
 | `_BOX_GET_BOX_STATE` | `[ADDR=<1..4>]` | Raw state response. |
 | `_BOX_GET_VERSION_SN` | `[ADDR=<1..4>]` | ASCII version/serial when decodable, plus raw response. |
-| `_BOX_GET_RFID` | `[ADDR=<1..4>] [NUM=<0..15>]` | RFID text when decodable. `NUM` remains a raw selector because this firmware's RFID indexing is unresolved. |
-| `_BOX_GET_REMAIN_LEN` | `[ADDR=<1..4>] [NUM=<0..15>]` | Raw remaining-length bytes. |
+| `_BOX_GET_RFID` | `[ADDR=<1..4>] [SLOT=A\|B\|C\|D]` | RFID text when decodable. Omitting `SLOT` queries the all-slot mask. |
+| `_BOX_GET_REMAIN_LEN` | `[ADDR=<1..4>] [SLOT=A\|B\|C\|D]` | Raw remaining-length bytes. Omitting `SLOT` queries the all-slot mask. |
 | `_BOX_GET_BUFFER_STATE` | `[ADDR=<1..4>]` | Decodes `MIDDLE=0`, `FULL=1`, or `EMPTY=2`. |
 | `_BOX_GET_FILAMENT_SENSOR_STATE` | `[ADDR=<1..4>] [POSITION=MATERIAL\|CONNECTIONS]` | Decodes the A-D sensor mask. |
-| `_BOX_SET_BOX_MODE` | `[ADDR=<1..4>] MODE=PRINT\|IDLE [NUM=A\|B\|C\|D\|0]` | Sets per-slot print mode or generic idle mode. |
-| `_BOX_SET_PRE_LOADING` | `[ADDR=<1..4>] [NUM=<0..15>] ACTION=CLOSE\|OPEN\|RUN\|TIGHT` | Controls preloading. `MASK` is accepted as a fallback alias for `NUM`. `RUN` and `TIGHT` use a 45-second timeout. |
+| `_BOX_SET_BOX_MODE` | `[ADDR=<1..4>] MODE=PRINT\|IDLE [SLOT=A\|B\|C\|D]` | Sets per-slot print mode or generic idle mode when `SLOT` is omitted. |
+| `_BOX_SET_PRE_LOADING` | `[ADDR=<1..4>] [SLOT=A\|B\|C\|D] ACTION=CLOSE\|OPEN\|RUN\|TIGHT` | Controls one slot, or all slots when `SLOT` is omitted. `RUN` and `TIGHT` use a 45-second timeout. |
 | `_BOX_CTRL_CONNECTION_MOTOR_ACTION` | `[ADDR=<1..4>] ACTION=STOP\|EXTRUDE\|RETRUDE` | Controls the shared-path connection motor. |
 | `_BOX_MEASURING_WHEEL` | `[ADDR=<1..4>] [ACTION=GET\|CLEAN]` | `GET` decodes the big-endian float distance. |
 | `_BOX_TIGHTEN_UP_ENABLE` | `[ADDR=<1..4>] ENABLE=ENABLE\|DISABLE` | Controls box tensioning using local wire polarity. |
-| `_BOX_EXTRUDE_PROCESS` | `[ADDR=<1..4>] NUM=A\|B\|C\|D STAGE=0\|3\|4\|5\|6\|7 [AMOUNT=<0..255>]` | Sends exactly one staged load command. |
-| `_BOX_RETRUDE_PROCESS` | `[ADDR=<1..4>] [NUM=A\|B\|C\|D\|0] [TRIGGER=BUFFER\|MATERIAL]` | Sends exactly one staged unload command. |
+| `_BOX_EXTRUDE_PROCESS` | `[ADDR=<1..4>] SLOT=A\|B\|C\|D STAGE=0\|3\|4\|5\|6\|7 [AMOUNT=<0..255>]` | Sends exactly one staged load command. |
+| `_BOX_RETRUDE_PROCESS` | `[ADDR=<1..4>] [SLOT=A\|B\|C\|D] [TRIGGER=BUFFER\|MATERIAL]` | Sends exactly one staged unload command; omitting `SLOT` uses the generic no-slot form. |
 | `_BOX_MOVE_DISTANCE` | `[ADDR=<1..4>] [DIRECTION=FORWARD\|EXTRUDE\|RETRUDE\|REVERSE] DIST=<1..255> [TIMEOUT=<0.05..120>]` | Moves the box feed motor directly. |
 | `_BOX_SEND_DATA` | `[ADDR=<1..4>] CMD=<0..255> [STATE=<0..255>] [TIMEOUT=<0.05..120>] [DATA=<hex>]` | Escape hatch for local command frames. Data is real hexadecimal: `DATA=0f01` and `DATA=0f,01` both send bytes `0f 01`. |
 
