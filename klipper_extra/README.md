@@ -4,19 +4,18 @@
 a real Klipper extra — gcode commands and a background status poll,
 instead of standalone scripts you run by hand.
 
-**Status: fully confirmed working end-to-end in a real Klipper
-(2026-08-16), including a slot switch.** `CFS_STATUS`, `CFS_RETRUDE
-SLOT=A`, and `CFS_EXTRUDE SLOT=B` have all run cleanly as real gcode
-commands through Moonraker - the box, the toolhead move, and the tip-form
-unload all worked together, with no manual assist and no crashes. Getting
-here took finding and fixing three real bugs along the way - see the
-sections below. `cmd_CFS_TOOLCHANGE` (the combined swap macro) is the
-next thing to exercise as a whole.
+**Hardware status:** the earlier integration was confirmed end-to-end on
+2026-08-16, including a slot switch, but the 2026-08-26 non-blocking serial
+transport and purge-bucket choreography rewrites are regression-tested only.
+Repeat the supervised checks below before trusting them unattended.
+`cmd_CFS_TOOLCHANGE` (the combined swap macro) is still the next thing to
+exercise as a whole.
 
-It also has a known architectural limitation, documented in the file's own
-header comment: it uses blocking serial calls from gcode command handlers,
-which isn't the ideal way to integrate with Klipper's single-threaded
-reactor. Fine for occasional manual commands; not yet built the "right" way.
+The serial transport is now integrated with Klipper's reactor: pyserial is
+non-blocking, its file descriptor is registered with `reactor.register_fd()`,
+and command handlers wait on reactor completions rather than blocking the
+single reactor thread. This is regression-tested without hardware; repeat the
+supervised live checks below after installing the updated extra.
 
 ## Addressing bug - found and fixed (2026-08-16)
 
@@ -81,6 +80,20 @@ Add to `printer.cfg`:
 serial: /dev/ttyUSB0
 baud: 230400
 box_addr: 1
+
+# Calibrate these on your printer; do not copy coordinates from another unit.
+purge_min_z: <minimum safe bucket travel Z>
+purge_entry_x: <X safely outside the bucket>
+purge_entry_y: <Y safely outside the bucket>
+# Configure one or both axes for the move from the entry point into the bucket.
+purge_y: <Y inside the bucket>
+
+# Optional motion tuning defaults:
+# purge_z_hop: 1
+# purge_move_speed: 1500
+# purge_wipe_accel: 15000
+# purge_wipe_speed: 12000
+# purge_wipe_repetitions: 3
 ```
 
 Restart Klipper (see the gotcha above if changes don't seem to apply),
@@ -89,6 +102,39 @@ then test read-only first:
 ```
 CFS_STATUS
 ```
+
+### Hidden low-level commands
+
+Every function in the extra's `FN` protocol table is also exposed as an
+underscore-prefixed G-code command. These commands intentionally have no
+Klipper `HELP` description, but can be called directly by macros or from the
+console. Replies always include the raw response; established query formats
+also include decoded values.
+
+| Command | Parameters |
+|---|---|
+| `_CFS_GET_RFID` | `SLOT_INDEX=<0-3>` (the RFID index mapping is still unresolved, so this deliberately does not pretend to be A-D) |
+| `_CFS_GET_REMAIN_LEN` | `SLOT_INDEX=<0-3>` |
+| `_CFS_SET_BOX_MODE` | `MODE=<PRINT\|IDLE> [SLOT=<NONE\|A\|B\|C\|D>]` |
+| `_CFS_GET_BUFFER_STATE` | none; decodes `MIDDLE`, `FULL`, or `EMPTY` |
+| `_CFS_CTRL_CONNECTION_MOTOR_ACTION` | `ACTION=<STOP\|EXTRUDE\|RETRUDE>` |
+| `_CFS_GET_FILAMENT_SENSOR_STATE` | `[BANK=<MATERIAL\|CONNECTIONS>]`; defaults to `MATERIAL` and decodes the slot bitmask |
+| `_CFS_GET_BOX_STATE` | none |
+| `_CFS_SET_PRE_LOADING` | `ACTION=<CLOSE\|OPEN\|RUN\|TIGHT> [SLOTS=<ALL\|ABCD>]`; slot letters may be combined, for example `SLOTS=AC` |
+| `_CFS_GET_MEASURING_WHEEL` | none; sends the confirmed `GET` action and decodes millimetres |
+| `_CFS_TIGHTEN_UP_ENABLE` | `ENABLED=<TRUE\|FALSE>` |
+| `_CFS_EXTRUDE_PROCESS` | `SLOT=<A\|B\|C\|D> STAGE=<0-255> [AMOUNT=<0-255>]` |
+| `_CFS_RETRUDE_PROCESS` | `SLOT=<A\|B\|C\|D> STAGE=<0-255>` |
+| `_CFS_GET_VERSION_SN` | none; decodes the ASCII version/serial text |
+| `_CFS_MOVE_DISTANCE` | `DIRECTION=<FORWARD\|REVERSE> DISTANCE=<1-255> [SLOT=<NONE\|A\|B\|C\|D>]` |
+| `_CFS_CMD_SET_SLAVE_ADDR` | `NEW_ADDRESS=<1-253> UID=<12-byte hex UID>`; `:` and `-` separators are accepted |
+| `_CFS_CMD_GET_SLAVE_INFO` | none; broadcasts the discovery request |
+| `_CFS_CMD_ONLINE_CHECK` | none; probes the configured `box_addr` |
+
+The commands which change modes, run motors, or assign an address are raw
+diagnostic operations: they do not perform the sequencing, toolhead safety
+moves, or cleanup provided by `CFS_EXTRUDE` and `CFS_RETRUDE`. Run them only
+under supervision.
 
 If it says "not addressed" (e.g. a genuinely first-ever run with a fresh
 box), try `CFS_RECONNECT`, which now falls back to full broadcast
@@ -107,32 +153,28 @@ gcode command path. Getting there took finding and fixing two real
 problems live:
 
 1. **A reactor-stall heater fault.** This extra's accumulated
-   `time.sleep()` calls (see KNOWN LIMITATION at the top of the file)
+   `time.sleep()` calls and blocking serial reads
    stalled Klipper's reactor long enough that `verify_heater` missed its
    update window and tripped a false "not heating at expected rate"
-   shutdown mid-run. Fixed: every `time.sleep()` in this file is now
-   `self._pause()` (`reactor.pause()`, cooperative) - confirmed live this
-   no longer trips. **Not fully fixed**: `_send()`'s own blocking
-   `ser.read()` calls (especially the ~20x poll loop) are a real, deeper
-   source of the same class of stall and could still cause problems on a
-   slower/flakier connection - see the file's KNOWN LIMITATION comment.
+   shutdown mid-run. Fixed in two stages: every `time.sleep()` became
+   `self._pause()` (`reactor.pause()`, cooperative), which was confirmed live,
+   and `_send()`'s blocking `ser.read()` loop was replaced on 2026-08-26 by a
+   `reactor.register_fd()` callback plus cooperative completion waits. The
+   serial rewrite is regression-tested but still needs supervised confirmation
+   on the printer.
 2. **A real physical collision.** The "go to extrude position" move used
    to default to `X148 Y225.3 Z30`, copied verbatim (never physically
    tested by us) from a factory `box.cfg` found on a different K1C. Live
    on this printer, that move crashed the toolhead into the frame near an
    overhead camera mount - the user had to hit emergency stop.
-   **`extrude_pos_x`/`extrude_pos_y`/`extrude_pos_z` now have no default
-   at all** - `CFS_EXTRUDE` refuses to run until you set all three
-   yourself in `[creality_cfs]`, calibrated live on your own printer the
-   same careful way the cut/purge positions were (small jogs from the
-   console, watching closely, well clear of anything - see
-   `docs/MANUAL.md`). The move itself is also now split into separate
-   Z-then-XY-then-Z legs instead of one diagonal `G1`. On this printer, a
-   careful step-by-step live jog (starting high and clear, then lowering
-   in small steps) found `X148 Y225 Z35` as a safe, working position -
-   2mm of margin above the ~33mm minimum already established for the
-   nearby purge station. Your printer's safe numbers will likely differ -
-   calibrate your own, don't copy these.
+   `CFS_EXTRUDE` now requires a calibrated `purge_min_z` and a distinct
+   `purge_entry_x`/`purge_entry_y` safely outside the bucket. It first raises
+   Z to that minimum (or adds a 1mm hop when already above it), travels to the
+   entry point, and only then moves the configured `purge_x` and/or `purge_y`
+   axis into the bucket. After loading, three high-acceleration in/out moves
+   break nozzle strands and finish outside before acceleration and G-code
+   state are restored. These coordinates remain printer-specific: calibrate
+   your own and do not copy values from another machine.
 
 `BOX_NOZZLE_CLEAN` and stage 7's exact 3rd payload byte remain
 unconfirmed guesses, but didn't block the live result.
