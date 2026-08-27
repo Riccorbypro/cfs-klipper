@@ -10,26 +10,14 @@
 # loaded into a running Klipper and tested. Review it, install it
 # carefully, and test each command individually before relying on it.
 #
-# KNOWN LIMITATION: this uses blocking pyserial calls (_send()'s own
-# ser.read() loop) from gcode command handlers. Klipper's reactor is
-# single-threaded, so a slow/stalled CFS response can briefly stall the
-# whole reactor (MCU keepalive, other gcode processing, and critically
-# its own heater PID/watchdog timers) for up to the timeout on that call.
-# This is not theoretical: live 2026-08-16, a CFS_EXTRUDE run's
-# accumulated stall time tripped a false verify_heater "not heating at
-# expected rate" shutdown mid-run (see FINDINGS.md). The plain
-# time.sleep() calls that made up part of that stall are fixed - they now
-# use self._pause() (reactor.pause(), cooperative) instead - but the
-# repeated blocking ser.read() calls inside _send() itself, especially the
-# ~20x poll loop in cmd_CFS_EXTRUDE, remain a real, NOT-yet-fixed source
-# of the same class of stall. For a small number of manually-triggered
-# commands this is usually fine in practice, but it's not how a "proper"
-# Klipper extra should be built long-term - see
-# gitstonelabs/creality-cfs-klipper's reactor.register_fd()-based
-# non-blocking approach (referenced in this repo's README credits) for
-# how to do this right. Fixing the serial I/O itself is on the roadmap,
-# not done yet - if you hit another heater_fault/reactor-stall-shaped
-# problem, this is where to look next.
+# SERIAL TRANSPORT: CFS I/O is reactor-driven and non-blocking. Pyserial is
+# opened with zero read/write timeouts and its file descriptor is registered
+# with reactor.register_fd(). _send() parks only its calling greenlet on a
+# reactor completion while the fd callback assembles the response, leaving
+# MCU keepalives, motion, LEDs, heater watchdogs, and other reactor work free
+# to run. A reactor.mutex() serializes the half-duplex bus so the periodic poll
+# cannot overwrite a gcode command's pending response. This replaces the old
+# blocking ser.read() loop that caused live verify_heater/reactor stalls.
 #
 # Installation: copy this file into klipper/klippy/extras/creality_cfs.py
 # on the printer, add a [creality_cfs] section to printer.cfg (see example
@@ -41,22 +29,20 @@
 #   serial: /dev/ttyUSB0
 #   baud: 230400
 #   box_addr: 1
-#   # REQUIRED before CFS_EXTRUDE will run at all - no default is shipped
-#   # any more (see the safety incident note by extrude_pos_x/y/z further
-#   # down). Calibrate these live on YOUR printer first: home, then jog
-#   # there in small steps from the console, watching closely the whole
-#   # time, well clear of anything (cameras, frame, wiring) before you
-#   # trust CFS_EXTRUDE to drive there on its own:
-#   extrude_pos_x: <calibrate this - see docs/MANUAL.md>
-#   extrude_pos_y: <calibrate this - see docs/MANUAL.md>
-#   extrude_pos_z: <calibrate this - see docs/MANUAL.md>
+#   # REQUIRED before CFS_EXTRUDE will run. Calibrate these live on YOUR
+#   # printer. The entry point is safely outside the purge bucket; purge_x
+#   # and/or purge_y then moves inward to actuate the bucket mechanism:
+#   purge_min_z: <minimum safe travel height>
+#   purge_entry_x: <safe X outside bucket>
+#   purge_entry_y: <safe Y outside bucket>
+#   purge_y: <Y inside bucket; omit purge_x to retain entry X>
 #   # optional, name of your real toolhead [filament_switch_sensor],
 #   # used by CFS_RETRUDE's tip-form unload sequence:
 #   toolhead_sensor_name: filament_sensor_2
 
 import logging
+import os
 import struct
-import time
 
 try:
     import serial
@@ -84,8 +70,32 @@ FN = {
     "CMD_ONLINE_CHECK": 0xA2,
 }
 
+RESPONSE_STATUS_NAMES = {
+    0x00: "OK",
+    0x01: "PARAMS_ERR",
+    0x02: "CRC_ERR",
+    0x03: "STATE_ERR",
+    0x04: "LENGTH_ERR",
+    0x08: "EXTRUDE_ERR4",
+    0x0C: "EXTRUDE_ERR8",
+    0x0D: "EXTRUDE_ERR10",
+    0x13: "RETRUDE_ERR2",
+    0x1A: "RETRUDE_ERR7",
+    0x30: "UPDATE_STATE",
+}
+
 SLOT_BYTES = {"A": 0x01, "B": 0x02, "C": 0x04, "D": 0x08}
 BROADCAST_ALL_BOXES = 0xFE
+# The reference implementation caps CFS payloads at 100 bytes. Responses in
+# this protocol are much smaller in practice; bounding the length also lets
+# the stream parser recover from a stray 0xF7 followed by a bogus length byte.
+MAX_RESPONSE_DATA = 100
+
+
+def format_gcode_number(value):
+    """Serialize a numeric setting without losing meaningful precision."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
 
 # "Tip-forming" toolhead move sequence for a clean, non-jamming unload -
 # see the identical table (and its full rationale) in cfs_protocol.py's
@@ -160,7 +170,7 @@ class CrealityCFS:
         self.box_addr = config.getint("box_addr", 1)
         self.poll_interval = config.getfloat("poll_interval", 5.0, above=0.0)
 
-        # "Go to extrude position" before EXTRUDE_PROCESS.
+        # Safe purge-bucket entry before EXTRUDE_PROCESS.
         #
         # SAFETY INCIDENT 2026-08-16: this used to default to X148/Y225.3/
         # Z30, copied verbatim (never physically tested by us) from a
@@ -169,23 +179,26 @@ class CrealityCFS:
         # where an overhead camera is mounted - the user had to hit
         # emergency stop. No injury/damage beyond a startled camera mount,
         # but this is a real collision hazard, not a theoretical one.
-        # There is now NO default - you must explicitly set all three of
-        # extrude_pos_x/y/z in printer.cfg yourself, calibrated live on
-        # YOUR printer the same careful way the cut and purge positions
-        # were calibrated (small G1 jogs from the console, watching the
-        # whole time, well before trusting a macro to do it automatically -
-        # see docs/MANUAL.md). cmd_CFS_EXTRUDE refuses to run at all until
-        # these are set. The move itself is also now split into separate
-        # Z-then-XY-then-Z legs (see below) instead of one diagonal G1, so
-        # a wrong number is less likely to carve a shortcut through
-        # something solid - but that is not a substitute for calibrating
-        # real numbers for your machine.
-        self.extrude_pos_x = config.getfloat("extrude_pos_x", None)
-        self.extrude_pos_y = config.getfloat("extrude_pos_y", None)
-        self.extrude_pos_z = config.getfloat("extrude_pos_z", None)
-        # Slower default than before (was 3600) - a wrong/uncalibrated
-        # position is easier to e-stop in time at a lower speed.
-        self.extrude_move_speed = config.getfloat("extrude_move_speed", 1500.0, above=0.0)
+        # Positions have no defaults: the bucket's location and safe travel
+        # height are printer-specific. purge_x/purge_y are individually
+        # optional because a cardinally-mounted bucket usually needs motion
+        # on only one axis; CFS_EXTRUDE requires at least one of them.
+        self.purge_min_z = config.getfloat("purge_min_z", None, minval=0.0)
+        self.purge_entry_x = config.getfloat("purge_entry_x", None)
+        self.purge_entry_y = config.getfloat("purge_entry_y", None)
+        self.purge_x = config.getfloat("purge_x", None)
+        self.purge_y = config.getfloat("purge_y", None)
+        self.purge_z_hop = config.getfloat("purge_z_hop", 1.0, above=0.0)
+        # Keep entry travel conservative; the strand-breaking exit has its
+        # own faster configured speed.
+        self.purge_move_speed = config.getfloat(
+            "purge_move_speed", 1500.0, above=0.0)
+        self.purge_wipe_accel = config.getfloat(
+            "purge_wipe_accel", 15000.0, above=0.0)
+        self.purge_wipe_speed = config.getfloat(
+            "purge_wipe_speed", 12000.0, above=0.0)
+        self.purge_wipe_repetitions = config.getint(
+            "purge_wipe_repetitions", 3, minval=1, maxval=10)
 
         # EXTRUDE stage 5->6->7 handoff tuning - see _extrude_material_handoff()
         # below for the full sequence this drives. UPDATED 2026-08-17: an
@@ -221,6 +234,14 @@ class CrealityCFS:
         self.toolhead_sensor_name = config.get("toolhead_sensor_name", "filament_sensor_2")
 
         self.ser = None
+        self._serial_fd_handle = None
+        self._rx_buffer = bytearray()
+        self._pending_response = None
+        self._pending_match = None
+        # The CFS link is half-duplex. Klipper's mutex parks competing
+        # greenlets cooperatively, so polling and gcode commands cannot race
+        # for the one pending response without blocking the reactor.
+        self._bus_lock = self.reactor.mutex()
         self.addressed = False
         self.last_status = {}
 
@@ -253,9 +274,8 @@ class CrealityCFS:
                                      "(~38s/slot) and untested by us - use supervised.")
         gcode.register_command("CFS_RECONNECT", self.cmd_CFS_RECONNECT,
                                 desc="CFS_RECONNECT - retry discovery/addressing manually. The "
-                                     "automatic attempt at klippy:connect is a single try with no "
-                                     "retry (see KNOWN LIMITATION at the top of this file) and can "
-                                     "lose a race with the USB device settling - if CFS_STATUS says "
+                                     "automatic attempt at klippy:connect can lose a race with "
+                                     "the USB device settling - if CFS_STATUS says "
                                      "'not addressed' after startup even though the box is known "
                                      "good, run this instead of a full restart.")
         gcode.register_command("CFS_SYNC_FEED", self.cmd_CFS_SYNC_FEED,
@@ -276,6 +296,14 @@ class CrealityCFS:
                                      "box's per-slot PRINT mode early/standalone, to test whether "
                                      "that's the real 'auto-feed on buffer demand' mode - see this "
                                      "command's own docstring.")
+        # Low-level protocol commands intentionally have no description, so
+        # Klipper omits them from HELP. They remain available for macros and
+        # supervised protocol diagnostics under their _CFS_* names.
+        for function_name in FN:
+            gcode.register_command(
+                "_CFS_%s" % function_name,
+                lambda gcmd, name=function_name:
+                    self._cmd_CFS_FUNCTION(gcmd, name))
 
         # Hidden, box.cfg-compatible low-level commands. The leading
         # underscore follows Klipper's convention for implementation
@@ -309,7 +337,40 @@ class CrealityCFS:
 
     def _open(self):
         if self.ser is None:
-            self.ser = serial.Serial(self.serial_path, baudrate=self.baud, timeout=1.0)
+            ser = serial.Serial(
+                self.serial_path, baudrate=self.baud, timeout=0, write_timeout=0)
+            try:
+                fd_handle = self.reactor.register_fd(
+                    ser.fileno(), self._handle_serial_read)
+            except Exception:
+                ser.close()
+                raise
+            self.ser = ser
+            self._serial_fd_handle = fd_handle
+            self._rx_buffer = bytearray()
+
+    def _close(self):
+        """Wake any waiter, unregister the reactor fd, and close the port."""
+        self.addressed = False
+        pending, self._pending_response = self._pending_response, None
+        self._pending_match = None
+        if pending is not None and not pending.test():
+            pending.complete(b"")
+
+        if self._serial_fd_handle is not None:
+            try:
+                self.reactor.unregister_fd(self._serial_fd_handle)
+            except Exception:
+                logging.exception("creality_cfs: failed to unregister serial fd")
+            self._serial_fd_handle = None
+
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self._rx_buffer = bytearray()
 
     def _pause(self, seconds):
         """Cooperative wait - use instead of a raw time.sleep() anywhere in
@@ -321,30 +382,120 @@ class CrealityCFS:
         stalled the reactor long enough that verify_heater's watchdog
         missed its update window and tripped a false "Heater extruder not
         heating at expected rate" shutdown, even though the hotend itself
-        was fine. This fixes the sleep-based part of that; the blocking
-        pyserial reads inside _send() are a separate, deeper source of the
-        same class of stall that this does NOT fix - see the file header's
-        KNOWN LIMITATION and _send()'s own comment."""
+        was fine. Serial response waits are cooperative too; see the file
+        header and _send()."""
         self.reactor.pause(self.reactor.monotonic() + seconds)
 
     def _send(self, slave_addr, status, function_code, data=b"", timeout=2.0, debug=False):
         self._open()
         frame = build_frame(slave_addr, status, function_code, data)
-        self.ser.reset_input_buffer()
         if debug:
             logging.info("creality_cfs: TX %s", frame.hex())
-        self.ser.write(frame)
-        self.ser.flush()
-        deadline = time.time() + timeout
-        total = b""
-        while time.time() < deadline:
+
+        # Broadcast requests are answered from a box's assigned unicast
+        # address, so only match their function code. Normal requests must
+        # match both address and function.
+        match_addr = None if slave_addr in (0xFE, 0xFF) else slave_addr
+        with self._bus_lock:
+            self.ser.reset_input_buffer()
+            self._rx_buffer = bytearray()
+            completion = self.reactor.completion()
+            self._pending_response = completion
+            self._pending_match = (match_addr, function_code)
+            try:
+                try:
+                    # Pyserial's POSIX write wrapper can busy-loop on EAGAIN
+                    # even with write_timeout=0. One raw write against its
+                    # O_NONBLOCK fd either succeeds immediately or fails this
+                    # transaction without monopolizing Klipper's reactor.
+                    written = os.write(self.ser.fileno(), frame)
+                except BlockingIOError:
+                    logging.warning(
+                        "creality_cfs: serial write would block; command not sent")
+                    return b""
+                except OSError:
+                    logging.exception("creality_cfs: serial write failed")
+                    self._close()
+                    return b""
+                if written != len(frame):
+                    logging.error(
+                        "creality_cfs: short non-blocking serial write (%s/%d bytes)",
+                        written, len(frame))
+                    self._close()
+                    return b""
+                response = completion.wait(
+                    self.reactor.monotonic() + timeout, b"")
+                if debug:
+                    logging.info(
+                        "creality_cfs: RX %s",
+                        response.hex() if response else "(nothing)")
+                return response or b""
+            finally:
+                if self._pending_response is completion:
+                    self._pending_response = None
+                    self._pending_match = None
+
+    def _handle_serial_read(self, eventtime):
+        """Read available bytes without blocking and extract complete frames."""
+        if self.ser is None:
+            return
+        try:
             chunk = self.ser.read(256)
-            if chunk:
-                total += chunk
-                deadline = time.time() + 0.3
-        if debug:
-            logging.info("creality_cfs: RX %s", total.hex() if total else "(nothing)")
-        return total
+        except Exception:
+            logging.exception("creality_cfs: serial read failed")
+            # A disconnected tty can remain level-triggered readable forever.
+            # Unregister it immediately to avoid a callback/log storm, and
+            # wake the active transaction so it need not wait for its timeout.
+            self._close()
+            return
+        if not chunk:
+            return
+        self._rx_buffer.extend(chunk)
+        self._parse_serial_frames()
+
+    def _parse_serial_frames(self):
+        """Parse [head, addr, length, ...] frames from the receive buffer."""
+        while True:
+            header_index = self._rx_buffer.find(0xF7)
+            if header_index < 0:
+                self._rx_buffer = bytearray()
+                return
+            if header_index:
+                del self._rx_buffer[:header_index]
+            if len(self._rx_buffer) < 3:
+                return
+
+            length = self._rx_buffer[2]
+            if length < 3 or length > MAX_RESPONSE_DATA + 3:
+                # Invalid length: discard this apparent header and resync.
+                del self._rx_buffer[0]
+                continue
+            frame_length = 3 + length
+            if len(self._rx_buffer) < frame_length:
+                return
+
+            response = bytes(self._rx_buffer[:frame_length])
+            del self._rx_buffer[:frame_length]
+            self._dispatch_serial_frame(response)
+
+    def _dispatch_serial_frame(self, response):
+        """Complete the active transaction when address and function match."""
+        if len(response) < 6 or crc8(response[2:-1]) != response[-1]:
+            logging.warning(
+                "creality_cfs: discarded serial frame with invalid CRC: %s",
+                response.hex())
+            return
+        pending = self._pending_response
+        if pending is None or pending.test():
+            return
+        response_addr = response[1] if len(response) >= 2 else None
+        response_function = response[4] if len(response) >= 5 else None
+        match_addr, match_function = self._pending_match
+        if ((match_addr is None or match_addr == response_addr)
+                and match_function == response_function):
+            self._pending_response = None
+            self._pending_match = None
+            pending.complete(response)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -357,12 +508,7 @@ class CrealityCFS:
         self.reactor.register_timer(self._poll_timer, self.reactor.NOW)
 
     def _handle_disconnect(self):
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
+        self._close()
 
     def _discover_and_address(self, attempts=3, retry_pause=1.5):
         # ROOT CAUSE FOUND 2026-08-16 (see FINDINGS.md for the full
@@ -420,12 +566,7 @@ class CrealityCFS:
             logging.warning("creality_cfs: no CFS box responded to discovery "
                             "(attempt %d/%d)", attempt, attempts)
             if attempt < attempts:
-                if self.ser is not None:
-                    try:
-                        self.ser.close()
-                    except Exception:
-                        pass
-                    self.ser = None
+                self._close()
                 self._pause(retry_pause)
 
     def _poll_timer(self, eventtime):
@@ -444,6 +585,188 @@ class CrealityCFS:
         return eventtime + self.poll_interval
 
     # -- gcode commands -----------------------------------------------
+
+    @staticmethod
+    def _required_parameter(gcmd, name):
+        value = gcmd.get(name, None)
+        if value is None:
+            raise gcmd.error("%s is required" % name)
+        return value
+
+    @staticmethod
+    def _choice_parameter(gcmd, name, choices, default=None):
+        value = gcmd.get(name, default)
+        if value is None:
+            raise gcmd.error("%s is required" % name)
+        value = value.upper()
+        if value not in choices:
+            raise gcmd.error("%s must be one of %s" % (
+                name, ", ".join(choices)))
+        return value, choices[value]
+
+    def _byte_parameter(self, gcmd, name, default=None, minval=0, maxval=255):
+        raw = gcmd.get(name, None if default is None else str(default))
+        if raw is None:
+            raise gcmd.error("%s is required" % name)
+        try:
+            value = int(raw, 0)
+        except (TypeError, ValueError):
+            raise gcmd.error("%s must be an integer" % name)
+        if value < minval or value > maxval:
+            raise gcmd.error("%s must be between %d and %d" % (
+                name, minval, maxval))
+        return value
+
+    def _slot_parameter(self, gcmd, default=None, allow_none=False):
+        choices = dict(SLOT_BYTES)
+        if allow_none:
+            choices["NONE"] = 0x00
+        return self._choice_parameter(gcmd, "SLOT", choices, default)[1]
+
+    def _slot_mask_parameter(self, gcmd):
+        value = gcmd.get("SLOTS", "ALL").upper().replace(",", "")
+        if value == "ALL":
+            return 0x0F
+        if not value or any(slot not in SLOT_BYTES for slot in value):
+            raise gcmd.error(
+                "SLOTS must be ALL or a combination of A, B, C, D")
+        mask = 0
+        for slot in value:
+            mask |= SLOT_BYTES[slot]
+        return mask
+
+    def _internal_request(self, gcmd, function_name):
+        """Translate one readable _CFS_* command into wire-level fields."""
+        addr = self.box_addr
+        status = 0xFF
+        data = b""
+        kwargs = {}
+
+        if function_name in ("GET_RFID", "GET_REMAIN_LEN"):
+            data = bytes([
+                self._byte_parameter(gcmd, "SLOT_INDEX", minval=0, maxval=3)])
+        elif function_name == "SET_BOX_MODE":
+            slot = self._slot_parameter(
+                gcmd, default="NONE", allow_none=True)
+            mode = self._choice_parameter(
+                gcmd, "MODE", {"PRINT": 0x00, "IDLE": 0x01})[1]
+            data = bytes([slot, mode])
+        elif function_name == "CTRL_CONNECTION_MOTOR_ACTION":
+            action = self._choice_parameter(
+                gcmd, "ACTION",
+                {"STOP": 0x00, "EXTRUDE": 0x01, "RETRUDE": 0x02})[1]
+            data = bytes([action])
+        elif function_name == "GET_FILAMENT_SENSOR_STATE":
+            bank = self._choice_parameter(
+                gcmd, "BANK", {"MATERIAL": 0x00, "CONNECTIONS": 0x01},
+                default="MATERIAL")[1]
+            data = bytes([bank])
+        elif function_name == "SET_PRE_LOADING":
+            action_name, action = self._choice_parameter(
+                gcmd, "ACTION",
+                {"CLOSE": 0x00, "OPEN": 0x01,
+                 "RUN": 0x02, "TIGHT": 0x03})
+            data = bytes([self._slot_mask_parameter(gcmd), action])
+            if action_name in ("RUN", "TIGHT"):
+                kwargs["timeout"] = 45.0
+        elif function_name == "GET_MEASURING_WHEEL":
+            # 0x01 is the GET action confirmed from the reference firmware.
+            data = bytes([0x01])
+        elif function_name == "TIGHTEN_UP_ENABLE":
+            enabled = self._choice_parameter(
+                gcmd, "ENABLED", {"FALSE": 0x00, "TRUE": 0x01})[1]
+            data = bytes([enabled])
+        elif function_name == "EXTRUDE_PROCESS":
+            data = bytes([
+                self._slot_parameter(gcmd),
+                self._byte_parameter(gcmd, "STAGE"),
+                self._byte_parameter(gcmd, "AMOUNT", default=0),
+            ])
+        elif function_name == "RETRUDE_PROCESS":
+            data = bytes([
+                self._slot_parameter(gcmd),
+                self._byte_parameter(gcmd, "STAGE"),
+            ])
+        elif function_name == "MOVE_DISTANCE":
+            slot = self._slot_parameter(
+                gcmd, default="NONE", allow_none=True)
+            direction = self._choice_parameter(
+                gcmd, "DIRECTION", {"FORWARD": 0x00, "REVERSE": 0x01})[1]
+            distance = self._byte_parameter(
+                gcmd, "DISTANCE", minval=1, maxval=255)
+            data = (bytes([direction, distance]) if slot == 0x00
+                    else bytes([slot, direction, distance]))
+        elif function_name == "CMD_SET_SLAVE_ADDR":
+            addr = BROADCAST_ALL_BOXES
+            status = 0x00
+            new_address = self._byte_parameter(
+                gcmd, "NEW_ADDRESS", minval=1, maxval=0xFD)
+            uid_text = self._required_parameter(gcmd, "UID")
+            normalized_uid = uid_text.replace(":", "").replace("-", "")
+            try:
+                uid = bytes.fromhex(normalized_uid)
+            except ValueError:
+                uid = b""
+            if len(uid) != 12:
+                raise gcmd.error("UID must contain exactly 12 bytes of hex")
+            data = bytes([new_address]) + uid
+        elif function_name == "CMD_GET_SLAVE_INFO":
+            addr = BROADCAST_ALL_BOXES
+            status = 0x00
+            data = bytes([BROADCAST_ALL_BOXES, BROADCAST_ALL_BOXES])
+        elif function_name == "CMD_ONLINE_CHECK":
+            # Address-management requests use status 0x00 on the wire.
+            status = 0x00
+
+        return addr, status, data, kwargs
+
+    def _format_internal_response(self, function_name, response):
+        if not response:
+            return ("_CFS_%s: status=unknown data=(empty) raw=(empty)" %
+                    function_name)
+
+        response_status = response[3] if len(response) >= 4 else None
+        data = response[5:-1] if len(response) >= 6 else b""
+        details = []
+        if function_name == "GET_BUFFER_STATE" and data:
+            details.append("buffer=%s" % {
+                0x00: "MIDDLE", 0x01: "FULL", 0x02: "EMPTY",
+            }.get(data[0], "UNKNOWN(%#04x)" % data[0]))
+        elif function_name == "GET_FILAMENT_SENSOR_STATE" and data:
+            slots = ",".join(
+                name for name, bit in SLOT_BYTES.items() if data[0] & bit)
+            details.append("bitmask=%#04x slots=%s" % (
+                data[0], slots or "NONE"))
+        elif function_name == "GET_MEASURING_WHEEL" and len(data) == 4:
+            details.append("distance=%.3fmm" % decode_measuring_wheel(data))
+        elif function_name in ("GET_RFID", "GET_VERSION_SN") and data:
+            details.append("text=%s" % data.decode("ascii", "replace"))
+        elif function_name.startswith("CMD_"):
+            uid = (data[2:14] if len(data) >= 14
+                   else data[:12] if len(data) >= 12 else None)
+            if uid is not None:
+                details.append("uid=%s" % uid.hex())
+
+        if response_status is None:
+            status_text = "unknown"
+        else:
+            status_text = "%#04x" % response_status
+            status_name = RESPONSE_STATUS_NAMES.get(response_status)
+            if status_name is not None:
+                status_text += "(%s)" % status_name
+        fields = ["status=%s" % status_text]
+        fields.extend(details)
+        fields.extend(["data=%s" % (data.hex() or "(empty)"),
+                       "raw=%s" % response.hex()])
+        return "_CFS_%s: %s" % (function_name, " ".join(fields))
+
+    def _cmd_CFS_FUNCTION(self, gcmd, function_name):
+        addr, status, data, kwargs = self._internal_request(
+            gcmd, function_name)
+        response = self._send(
+            addr, status, FN[function_name], data, **kwargs)
+        gcmd.respond_info(self._format_internal_response(
+            function_name, response))
 
     def _direct_addr(self, gcmd):
         return gcmd.get_int("ADDR", self.box_addr, minval=1, maxval=4)
@@ -837,12 +1160,7 @@ class CrealityCFS:
         # cfs_cli.py tool, which opens a fresh connection every time,
         # kept working throughout even when this extra's persistent one
         # didn't - see FINDINGS.md).
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
+        self._close()
         try:
             self._discover_and_address()
         except Exception as e:
@@ -863,11 +1181,12 @@ class CrealityCFS:
         sends a box command, waits for its reply, THEN sends a toolhead
         move - never truly concurrent. This command fires the box's raw
         MOVE_DISTANCE (fn 0x31 - a direct feed-motor move, not the full
-        EXTRUDE_PROCESS state machine) with a short timeout (don't block
-        waiting on its reply) immediately followed by a toolhead G1 E move
+        EXTRUDE_PROCESS state machine) with a short response timeout,
+        immediately followed by a toolhead G1 E move
         of the same distance, to get them physically overlapping in time
-        as closely as this extra's blocking, single-threaded architecture
-        allows. CFS_SYNC_FEED DIST=<mm, 1-255, default 100>."""
+        as closely as this request/reply sequence allows. The response wait
+        yields to Klipper's reactor, but the toolhead move still starts only
+        after that wait returns. CFS_SYNC_FEED DIST=<mm, 1-255, default 100>."""
         dist = gcmd.get_int("DIST", 100, minval=1, maxval=255)
         self.gcode.run_script_from_command("M83")
         self._send(self.box_addr, 0xFF, FN["MOVE_DISTANCE"],
@@ -1002,6 +1321,169 @@ class CrealityCFS:
         gcmd.respond_info("CFS_RETRUDE slot=%s complete (tip-form unload %s)" % (
             slot_letter, "confirmed clear" if ok else "did NOT confirm clear - check physically"))
 
+    def _approach_purge_bucket(self, current_z):
+        """Lift safely, then travel to the bucket's outside entry point."""
+        travel_z = (self.purge_min_z if current_z < self.purge_min_z
+                    else current_z + self.purge_z_hop)
+
+        self.gcode.run_script_from_command("G90")
+        self.gcode.run_script_from_command(
+            "G1 Z%.2f F%.0f" % (travel_z, self.purge_move_speed))
+        self.gcode.run_script_from_command("M400")
+        self.gcode.run_script_from_command(
+            "G1 X%.2f Y%.2f F%.0f" % (
+                self.purge_entry_x, self.purge_entry_y,
+                self.purge_move_speed))
+        self.gcode.run_script_from_command("M400")
+
+    def _move_into_purge_bucket(self, speed):
+        """Queue the configured cardinal move from the entry point inward."""
+        purge_axes = []
+        if self.purge_x is not None:
+            purge_axes.append("X%.2f" % self.purge_x)
+        if self.purge_y is not None:
+            purge_axes.append("Y%.2f" % self.purge_y)
+        self.gcode.run_script_from_command(
+            "G1 %s F%.0f" % (" ".join(purge_axes), speed))
+
+    def _exit_purge_bucket(self, original_accel):
+        """Break nozzle strands, finish outside the bucket, and restore state."""
+        entry_move = "G1 X%.2f Y%.2f F%.0f" % (
+            self.purge_entry_x, self.purge_entry_y, self.purge_wipe_speed)
+        purge_axes = []
+        if self.purge_x is not None:
+            purge_axes.append("X%.2f" % self.purge_x)
+        if self.purge_y is not None:
+            purge_axes.append("Y%.2f" % self.purge_y)
+        purge_move = "G1 %s F%.0f" % (
+            " ".join(purge_axes), self.purge_wipe_speed)
+
+        first_error = None
+        acceleration_changed = False
+        try:
+            self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT ACCEL=%s" %
+                format_gcode_number(self.purge_wipe_accel))
+            acceleration_changed = True
+            for _ in range(self.purge_wipe_repetitions):
+                self.gcode.run_script_from_command(entry_move)
+                self.gcode.run_script_from_command(purge_move)
+        except Exception as exc:
+            first_error = exc
+
+        # Always attempt the final evacuation independently of wipe failures.
+        # This is especially important when an entry move fails while the
+        # nozzle is still physically inside the bucket.
+        try:
+            self.gcode.run_script_from_command(entry_move)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                logging.exception(
+                    "creality_cfs: final purge-bucket evacuation move failed")
+        try:
+            self.gcode.run_script_from_command("M400")
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                logging.exception(
+                    "creality_cfs: purge-bucket evacuation wait failed")
+
+        if acceleration_changed:
+            try:
+                self.gcode.run_script_from_command(
+                    "SET_VELOCITY_LIMIT ACCEL=%s" %
+                    format_gcode_number(original_accel))
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    logging.exception(
+                        "creality_cfs: acceleration restoration failed")
+        try:
+            self.gcode.run_script_from_command(
+                "RESTORE_GCODE_STATE NAME=CFS_EXTRUDE")
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                logging.exception(
+                    "creality_cfs: G-code state restoration failed")
+
+        if first_error is not None:
+            raise first_error
+
+    def _cleanup_box_after_load(self):
+        """Attempt every box cleanup command and return the first failure."""
+        first_error = None
+        cleanup_commands = (
+            (FN["TIGHTEN_UP_ENABLE"], bytes([0x00])),
+            (FN["CTRL_CONNECTION_MOTOR_ACTION"], bytes([0x00])),
+            # A completed run can leave a latched error status even after a
+            # successful load. Re-entering IDLE clears it on live hardware.
+            (FN["SET_BOX_MODE"], bytes([0x00, 0x01])),
+        )
+        for function_code, data in cleanup_commands:
+            try:
+                self._send(self.box_addr, 0xFF, function_code, data)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                logging.exception(
+                    "creality_cfs: box cleanup command %#04x failed",
+                    function_code)
+        return first_error
+
+    def _load_filament_in_bucket(self, gcmd, slot, polls):
+        """Run the box loading stages while guaranteeing box-side cleanup."""
+        load_error = None
+        try:
+            self._send(
+                self.box_addr, 0xFF, FN["CTRL_CONNECTION_MOTOR_ACTION"],
+                bytes([0x01]))
+            self._pause(0.5)
+            self._send(
+                self.box_addr, 0xFF, FN["TIGHTEN_UP_ENABLE"], bytes([0x01]))
+            self._pause(0.3)
+
+            # EXTRUDE_PROCESS payload is [slot, stage, amount] - 3 bytes.
+            # Live hardware rejected the 2-byte form inferred from decompiled
+            # host code, so retain the empirically validated 3-byte payload.
+            self._send(
+                self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"],
+                bytes([slot, 0x00, 0x00]))
+            self._pause(0.3)
+            self._send(
+                self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"],
+                bytes([slot, 0x04, 0x00]))
+            self._pause(0.3)
+
+            for _ in range(polls):
+                self._send(
+                    self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"],
+                    bytes([slot, 0x05, 0x00]))
+                self._pause(0.4)
+
+            handoff_ok = self._extrude_material_handoff(gcmd, slot)
+            if not handoff_ok:
+                gcmd.respond_info(
+                    "CFS_EXTRUDE: handoff did not confirm success - "
+                    "check physically before printing")
+
+            # Mark this slot as the active PRINT-mode slot after handoff.
+            self._send(
+                self.box_addr, 0xFF, FN["SET_BOX_MODE"], bytes([slot, 0x00]))
+            return handoff_ok
+        except Exception as exc:
+            load_error = exc
+            raise
+        finally:
+            cleanup_error = self._cleanup_box_after_load()
+            if load_error is None and cleanup_error is not None:
+                raise cleanup_error
+
     def cmd_CFS_EXTRUDE(self, gcmd):
         # STATUS 2026-08-16/17: slot switching itself is confirmed working
         # live on all 4 slots via this command. What ISN'T yet confirmed
@@ -1059,19 +1541,28 @@ class CrealityCFS:
         polls = gcmd.get_int("POLLS", 20, minval=1, maxval=200)
 
         toolhead = self.printer.lookup_object("toolhead")
-        homed = toolhead.get_status(self.reactor.monotonic())["homed_axes"]
+        toolhead_status = toolhead.get_status(self.reactor.monotonic())
+        homed = toolhead_status["homed_axes"]
+        original_accel = toolhead_status["max_accel"]
         if not all(axis in homed for axis in "xyz"):
             raise gcmd.error("CFS_EXTRUDE: home the printer first (G28) - "
                               "refusing to move to the extrude position unhomed")
-        if None in (self.extrude_pos_x, self.extrude_pos_y, self.extrude_pos_z):
+        has_required_positions = None not in (
+            self.purge_min_z, self.purge_entry_x, self.purge_entry_y)
+        has_purge_displacement = has_required_positions and (
+            (self.purge_x is not None
+             and float("%.2f" % self.purge_x)
+             != float("%.2f" % self.purge_entry_x))
+            or (self.purge_y is not None
+                and float("%.2f" % self.purge_y)
+                != float("%.2f" % self.purge_entry_y)))
+        if not has_purge_displacement:
             raise gcmd.error(
-                "CFS_EXTRUDE: extrude_pos_x/y/z are not set in [creality_cfs] - "
-                "refusing to guess. A previous default here crashed a real "
-                "toolhead into the printer frame (2026-08-16 safety incident, "
-                "see this file's header comment). Calibrate a safe position by "
-                "jogging there manually and watching closely first, the same "
-                "way the cut/purge positions were calibrated - see "
-                "docs/MANUAL.md - then set all three in printer.cfg.")
+                "CFS_EXTRUDE: purge_min_z and purge_entry_x/y must be set, "
+                "and purge_x/purge_y must define non-zero bucket geometry, "
+                "in [creality_cfs]. "
+                "Refusing to guess bucket geometry; calibrate these positions "
+                "with supervised manual jogs first (see docs/MANUAL.md).")
 
         self._reset_pre_loading()
 
@@ -1082,78 +1573,44 @@ class CrealityCFS:
         self._send(self.box_addr, 0xFF, FN["SET_BOX_MODE"], bytes([0x00, 0x01]))
         self._pause(0.3)
 
-        # Step 2: BOX_GO_TO_EXTRUDE_POS equivalent.
-        #
-        # Split into three separate legs (Z, then XY, then Z) instead of
-        # one diagonal G1 that moves all three axes at once - added after
-        # the 2026-08-16 frame collision (see the safety incident note by
-        # extrude_pos_x/y/z above). A single diagonal move's exact path
-        # depends on wherever the toolhead happened to be beforehand, which
-        # made it easy to accidentally sweep through solid stuff. This
-        # doesn't make an uncalibrated position safe - it only avoids
-        # *extra*, unpredictable diagonal shortcuts on top of whatever
-        # calibrated position you've set. Whichever Z the toolhead is
-        # already at when this leg 1 move starts is used as the travel
-        # height for the XY leg - if that's not clear of obstacles on your
-        # printer, raise Z manually to a known-clear height before calling
-        # CFS_EXTRUDE.
-        self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=CFS_EXTRUDE")
-        self.gcode.run_script_from_command("G90")
-        self.gcode.run_script_from_command(
-            "G1 Z%.2f F%.0f" % (self.extrude_pos_z, self.extrude_move_speed))
-        self.gcode.run_script_from_command("M400")
-        self.gcode.run_script_from_command(
-            "G1 X%.2f Y%.2f F%.0f" % (
-                self.extrude_pos_x, self.extrude_pos_y, self.extrude_move_speed))
-        self.gcode.run_script_from_command("M400")
-
-        self._send(self.box_addr, 0xFF, FN["CTRL_CONNECTION_MOTOR_ACTION"], bytes([0x01]))
-        self._pause(0.5)
-        self._send(self.box_addr, 0xFF, FN["TIGHTEN_UP_ENABLE"], bytes([0x01]))
-        self._pause(0.3)
-
-        # EXTRUDE_PROCESS payload is [slot, stage, amount] - 3 bytes,
-        # amount usually 0x00. We briefly tried a 2-byte [slot, stage] form
-        # (matching what decompiling Creality's official *host-side*
-        # driver code appeared to send - see FINDINGS.md) but that
-        # regressed live: even slot A, reliable for many sessions, started
-        # failing PARAMS_ERR immediately with 2 bytes, and went back to
-        # producing real motor movement the moment we reverted to 3.
-        # Trust live hardware behavior over decompiled source when they
-        # disagree - this box's own onboard firmware apparently doesn't
-        # match whatever transport framing the host-side code assumes.
-        self._send(self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"], bytes([slot, 0x00, 0x00]))
-        self._pause(0.3)
-        self._send(self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"], bytes([slot, 0x04, 0x00]))
-        self._pause(0.3)
-
-        for _ in range(polls):
-            self._send(self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"], bytes([slot, 0x05, 0x00]))
-            self._pause(0.4)
-
-        # Stage 6/7 handoff - see _extrude_material_handoff()'s own docstring
-        # for the full story (ported 2026-08-17 from decompiled reference,
-        # replacing an earlier single-shot version that didn't verify
-        # against the measuring wheel and had no retry logic).
-        handoff_ok = self._extrude_material_handoff(gcmd, slot)
-        if not handoff_ok:
-            gcmd.respond_info("CFS_EXTRUDE: handoff did not confirm success - "
-                               "check physically before printing")
-        # Mark this specific slot as the active PRINT-mode slot - payload
-        # [slot_bitmask, 0x00], NOT the fixed [0x00, mode] pair used for the
-        # generic enter-feed-mode / cleanup calls elsewhere in this file.
-        self._send(self.box_addr, 0xFF, FN["SET_BOX_MODE"], bytes([slot, 0x00]))
-
-        self._send(self.box_addr, 0xFF, FN["TIGHTEN_UP_ENABLE"], bytes([0x00]))
-        self._send(self.box_addr, 0xFF, FN["CTRL_CONNECTION_MOTOR_ACTION"], bytes([0x00]))
-        # A completed run can leave the box reporting a latched error status
-        # (seen live: EXTRUDE_ERR8 on GET_BOX_STATE) even when the extrude
-        # itself succeeded (toolhead sensor confirmed). A fresh
-        # SET_BOX_MODE(IDLE) clears it - confirmed live on real hardware.
-        self._send(self.box_addr, 0xFF, FN["SET_BOX_MODE"], bytes([0x00, 0x01]))
-
-        # RESTORE_POSITION equivalent
-        self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=CFS_EXTRUDE")
+        # Step 2: save the caller's coordinate state, lift to a safe travel Z,
+        # approach the bucket, then move inward to actuate it. Keep the inward
+        # move separate so a failure during the safe approach restores state
+        # without performing a potentially unsafe wipe sequence.
+        state_saved = False
+        bucket_entry_commanded = False
+        operation_error = None
+        try:
+            self.gcode.run_script_from_command(
+                "SAVE_GCODE_STATE NAME=CFS_EXTRUDE")
+            state_saved = True
+            gcode_move = self.printer.lookup_object("gcode_move")
+            move_status = gcode_move.get_status(self.reactor.monotonic())
+            current_z = move_status["gcode_position"][2]
+            self._approach_purge_bucket(current_z)
+            self._move_into_purge_bucket(self.purge_move_speed)
+            bucket_entry_commanded = True
+            self.gcode.run_script_from_command("M400")
+            handoff_ok = self._load_filament_in_bucket(gcmd, slot, polls)
+        except Exception as exc:
+            operation_error = exc
+            raise
+        finally:
+            if state_saved:
+                try:
+                    if bucket_entry_commanded:
+                        # Even a failed entry wait or load must leave the
+                        # nozzle outside and restore acceleration/state.
+                        self._exit_purge_bucket(original_accel)
+                    else:
+                        self.gcode.run_script_from_command(
+                            "RESTORE_GCODE_STATE NAME=CFS_EXTRUDE")
+                except Exception:
+                    if operation_error is None:
+                        raise
+                    logging.exception(
+                        "creality_cfs: bucket recovery failed while handling "
+                        "an earlier CFS_EXTRUDE error")
         gcmd.respond_info("CFS_EXTRUDE slot=%s complete (%d polls, handoff %s)" % (
             slot_letter, polls, "confirmed" if handoff_ok else "NOT confirmed - check physically"))
 
