@@ -305,6 +305,34 @@ class CrealityCFS:
                 lambda gcmd, name=function_name:
                     self._cmd_CFS_FUNCTION(gcmd, name))
 
+        # Hidden, box.cfg-compatible low-level commands. The leading
+        # underscore follows Klipper's convention for implementation
+        # commands that macros may call but users should not normally see
+        # in HELP. These intentionally translate named parameters to this
+        # project's live-validated F7/CRC8 protocol; the referenced
+        # serial_485 wrapper uses different command ids and framing, so its
+        # numeric packets must not be copied verbatim.
+        direct_commands = {
+            "_BOX_GET_BOX_STATE": self.cmd_BOX_GET_BOX_STATE,
+            "_BOX_GET_VERSION_SN": self.cmd_BOX_GET_VERSION_SN,
+            "_BOX_GET_RFID": self.cmd_BOX_GET_RFID,
+            "_BOX_GET_REMAIN_LEN": self.cmd_BOX_GET_REMAIN_LEN,
+            "_BOX_GET_BUFFER_STATE": self.cmd_BOX_GET_BUFFER_STATE,
+            "_BOX_GET_FILAMENT_SENSOR_STATE": self.cmd_BOX_GET_FILAMENT_SENSOR_STATE,
+            "_BOX_SET_BOX_MODE": self.cmd_BOX_SET_BOX_MODE,
+            "_BOX_SET_PRE_LOADING": self.cmd_BOX_SET_PRE_LOADING,
+            "_BOX_CTRL_CONNECTION_MOTOR_ACTION": self.cmd_BOX_CTRL_CONNECTION_MOTOR_ACTION,
+            "_BOX_MEASURING_WHEEL": self.cmd_BOX_MEASURING_WHEEL,
+            "_BOX_TIGHTEN_UP_ENABLE": self.cmd_BOX_TIGHTEN_UP_ENABLE,
+            "_BOX_EXTRUDE_PROCESS": self.cmd_BOX_EXTRUDE_PROCESS,
+            "_BOX_RETRUDE_PROCESS": self.cmd_BOX_RETRUDE_PROCESS,
+            "_BOX_MOVE_DISTANCE": self.cmd_BOX_MOVE_DISTANCE,
+            "_BOX_SEND_DATA": self.cmd_BOX_SEND_DATA,
+        }
+        for name, handler in direct_commands.items():
+            # No desc: Klipper only adds described commands to HELP.
+            gcode.register_command(name, handler)
+
     # -- low level transport -------------------------------------------
 
     def _open(self):
@@ -739,6 +767,241 @@ class CrealityCFS:
             addr, status, FN[function_name], data, **kwargs)
         gcmd.respond_info(self._format_internal_response(
             function_name, response))
+
+    def _direct_addr(self, gcmd):
+        return gcmd.get_int("ADDR", self.box_addr, minval=1, maxval=4)
+
+    def _direct_enum(self, gcmd, name, values, default=None):
+        value = gcmd.get(name, default)
+        if value is None:
+            raise gcmd.error("%s is required" % name)
+        value = value.upper()
+        if value not in values:
+            raise gcmd.error("%s must be one of %s" % (
+                name, ", ".join(values)))
+        return value, values[value]
+
+    def _direct_slot(self, gcmd, name="NUM", default=None, allow_zero=False):
+        value = gcmd.get(name, default)
+        if value is None:
+            raise gcmd.error("%s is required" % name)
+        value = value.upper()
+        if allow_zero and value == "0":
+            return value, 0x00
+        if value not in SLOT_BYTES:
+            allowed = "A, B, C, D%s" % (", 0" if allow_zero else "")
+            raise gcmd.error("%s must be one of %s" % (name, allowed))
+        return value, SLOT_BYTES[value]
+
+    def _direct_byte(self, gcmd, name, default=None):
+        raw = gcmd.get(name, None)
+        if raw is None:
+            if default is None:
+                raise gcmd.error("%s is required" % name)
+            return default
+        try:
+            value = int(raw, 0)
+        except (TypeError, ValueError):
+            raise gcmd.error("%s must be a byte (decimal or 0x-prefixed hex)" % name)
+        if not 0 <= value <= 0xFF:
+            raise gcmd.error("%s must be between 0 and 255" % name)
+        return value
+
+    def _direct_send(self, gcmd, label, function_code, data=b"", timeout=2.0,
+                     decoder=None):
+        addr = self._direct_addr(gcmd)
+        resp = self._send(addr, 0xFF, function_code, data, timeout=timeout)
+        status = resp[3] if len(resp) >= 4 else None
+        detail = decoder(resp) if decoder is not None else None
+        message = "%s ADDR=%d status=%s" % (
+            label, addr, hex(status) if status is not None else "no reply")
+        if detail:
+            message += " %s" % detail
+        message += " raw=%s" % (resp.hex() if resp else "(none)")
+        gcmd.respond_info(message)
+        return resp
+
+    @staticmethod
+    def _direct_hex_data(gcmd):
+        raw = gcmd.get("DATA", "").strip()
+        if not raw:
+            return b""
+        try:
+            if " " in raw or "," in raw:
+                tokens = raw.replace(",", " ").split()
+                data = bytes(int(token, 16) for token in tokens)
+            else:
+                compact = raw[2:] if raw.lower().startswith("0x") else raw
+                if len(compact) % 2:
+                    raise ValueError
+                data = bytes.fromhex(compact)
+        except (TypeError, ValueError):
+            raise gcmd.error(
+                "DATA must be hex, for example DATA=0f01 or DATA=0f,01")
+        return data
+
+    def cmd_BOX_GET_BOX_STATE(self, gcmd):
+        self._direct_send(gcmd, "_BOX_GET_BOX_STATE", FN["GET_BOX_STATE"])
+
+    def cmd_BOX_GET_VERSION_SN(self, gcmd):
+        def decode(resp):
+            if len(resp) < 7:
+                return None
+            try:
+                value = resp[5:-1].decode("ascii")
+            except UnicodeDecodeError:
+                return None
+            return "version_sn=%s" % value
+
+        self._direct_send(gcmd, "_BOX_GET_VERSION_SN", FN["GET_VERSION_SN"],
+                          decoder=decode)
+
+    def cmd_BOX_GET_RFID(self, gcmd):
+        # NUM remains a raw 0..15 selector because this box firmware's RFID
+        # indexing has not been conclusively mapped to the slot bitmask.
+        num = gcmd.get_int("NUM", 0x0F, minval=0, maxval=15)
+
+        def decode(resp):
+            if len(resp) < 7:
+                return None
+            try:
+                return "rfid=%s" % resp[5:-1].decode("ascii")
+            except UnicodeDecodeError:
+                return None
+
+        self._direct_send(gcmd, "_BOX_GET_RFID", FN["GET_RFID"], bytes([num]),
+                          decoder=decode)
+
+    def cmd_BOX_GET_REMAIN_LEN(self, gcmd):
+        num = gcmd.get_int("NUM", 0x0F, minval=0, maxval=15)
+
+        def decode(resp):
+            return "remain=%s" % resp[5:-1].hex() if len(resp) >= 7 else None
+
+        self._direct_send(gcmd, "_BOX_GET_REMAIN_LEN", FN["GET_REMAIN_LEN"],
+                          bytes([num]), decoder=decode)
+
+    def cmd_BOX_GET_BUFFER_STATE(self, gcmd):
+        def decode(resp):
+            if len(resp) < 6:
+                return None
+            value = resp[5]
+            name = {0: "MIDDLE", 1: "FULL", 2: "EMPTY"}.get(value, "UNKNOWN")
+            return "buffer=%s(%d)" % (name, value)
+
+        self._direct_send(gcmd, "_BOX_GET_BUFFER_STATE", FN["GET_BUFFER_STATE"],
+                          decoder=decode)
+
+    def cmd_BOX_GET_FILAMENT_SENSOR_STATE(self, gcmd):
+        position, bank = self._direct_enum(
+            gcmd, "POSITION", {"MATERIAL": 0x00, "CONNECTIONS": 0x01},
+            default="MATERIAL")
+
+        def decode(resp):
+            if len(resp) < 6:
+                return None
+            mask = resp[5]
+            slots = [name for name, bit in SLOT_BYTES.items() if mask & bit]
+            return "%s=%#04x slots=%s" % (
+                position.lower(), mask, ",".join(slots) or "none")
+
+        self._direct_send(gcmd, "_BOX_GET_FILAMENT_SENSOR_STATE",
+                          FN["GET_FILAMENT_SENSOR_STATE"], bytes([bank]),
+                          decoder=decode)
+
+    def cmd_BOX_SET_BOX_MODE(self, gcmd):
+        _, slot = self._direct_slot(gcmd, default="0", allow_zero=True)
+        _, mode = self._direct_enum(
+            gcmd, "MODE", {"PRINT": 0x00, "IDLE": 0x01})
+        self._direct_send(gcmd, "_BOX_SET_BOX_MODE", FN["SET_BOX_MODE"],
+                          bytes([slot, mode]))
+
+    def cmd_BOX_SET_PRE_LOADING(self, gcmd):
+        raw_num = gcmd.get("NUM", None)
+        if raw_num is None:
+            num = gcmd.get_int("MASK", 0x0F, minval=0, maxval=15)
+        else:
+            try:
+                num = int(raw_num, 0)
+            except ValueError:
+                raise gcmd.error("NUM must be a slot mask between 0 and 15")
+            if not 0 <= num <= 15:
+                raise gcmd.error("NUM must be a slot mask between 0 and 15")
+        action_name, action = self._direct_enum(
+            gcmd, "ACTION", {"CLOSE": 0x00, "OPEN": 0x01,
+                              "RUN": 0x02, "TIGHT": 0x03},
+            default="CLOSE")
+        timeout = 45.0 if action_name in ("RUN", "TIGHT") else 2.0
+        self._direct_send(gcmd, "_BOX_SET_PRE_LOADING", FN["SET_PRE_LOADING"],
+                          bytes([num, action]), timeout=timeout)
+
+    def cmd_BOX_CTRL_CONNECTION_MOTOR_ACTION(self, gcmd):
+        _, action = self._direct_enum(
+            gcmd, "ACTION", {"STOP": 0x00, "EXTRUDE": 0x01, "RETRUDE": 0x02})
+        self._direct_send(gcmd, "_BOX_CTRL_CONNECTION_MOTOR_ACTION",
+                          FN["CTRL_CONNECTION_MOTOR_ACTION"], bytes([action]))
+
+    def cmd_BOX_MEASURING_WHEEL(self, gcmd):
+        action_name, action = self._direct_enum(
+            gcmd, "ACTION", {"CLEAN": 0x00, "GET": 0x01}, default="GET")
+
+        def decode(resp):
+            if action_name != "GET" or len(resp) < 10:
+                return None
+            value = decode_measuring_wheel(resp[5:-1])
+            return "distance=%.3fmm" % value if value is not None else None
+
+        self._direct_send(gcmd, "_BOX_MEASURING_WHEEL",
+                          FN["GET_MEASURING_WHEEL"], bytes([action]), decoder=decode)
+
+    def cmd_BOX_TIGHTEN_UP_ENABLE(self, gcmd):
+        # This project's live protocol uses 1=enable, 0=disable. The
+        # referenced serial_485 wrapper documents the opposite polarity.
+        # Keep the human-readable API, translate to the validated bytes.
+        _, enable = self._direct_enum(
+            gcmd, "ENABLE", {"ENABLE": 0x01, "DISABLE": 0x00})
+        self._direct_send(gcmd, "_BOX_TIGHTEN_UP_ENABLE",
+                          FN["TIGHTEN_UP_ENABLE"], bytes([enable]))
+
+    def cmd_BOX_EXTRUDE_PROCESS(self, gcmd):
+        _, slot = self._direct_slot(gcmd)
+        stage = gcmd.get_int("STAGE", minval=0, maxval=7)
+        if stage not in (0, 3, 4, 5, 6, 7):
+            raise gcmd.error("STAGE must be one of 0, 3, 4, 5, 6, 7")
+        amount = self._direct_byte(gcmd, "AMOUNT", 0x03 if stage == 7 else 0x00)
+        self._direct_send(gcmd, "_BOX_EXTRUDE_PROCESS", FN["EXTRUDE_PROCESS"],
+                          bytes([slot, stage, amount]))
+
+    def cmd_BOX_RETRUDE_PROCESS(self, gcmd):
+        _, slot = self._direct_slot(gcmd, default="0", allow_zero=True)
+        _, trigger = self._direct_enum(
+            gcmd, "TRIGGER", {"BUFFER": 0x00, "MATERIAL": 0x01},
+            default="BUFFER")
+        self._direct_send(gcmd, "_BOX_RETRUDE_PROCESS", FN["RETRUDE_PROCESS"],
+                          bytes([slot, trigger]))
+
+    def cmd_BOX_MOVE_DISTANCE(self, gcmd):
+        _, direction = self._direct_enum(
+            gcmd, "DIRECTION", {"FORWARD": 0x00, "EXTRUDE": 0x00,
+                                 "RETRUDE": 0x01, "REVERSE": 0x01},
+            default="FORWARD")
+        dist = gcmd.get_int("DIST", minval=1, maxval=255)
+        timeout = gcmd.get_float("TIMEOUT", 2.0, minval=0.05, maxval=120.0)
+        self._direct_send(gcmd, "_BOX_MOVE_DISTANCE", FN["MOVE_DISTANCE"],
+                          bytes([direction, dist]), timeout=timeout)
+
+    def cmd_BOX_SEND_DATA(self, gcmd):
+        command = self._direct_byte(gcmd, "CMD")
+        status = self._direct_byte(gcmd, "STATE", 0xFF)
+        timeout = gcmd.get_float("TIMEOUT", 2.0, minval=0.05, maxval=120.0)
+        data = self._direct_hex_data(gcmd)
+        addr = self._direct_addr(gcmd)
+        resp = self._send(addr, status, command, data, timeout=timeout)
+        response_status = resp[3] if len(resp) >= 4 else None
+        gcmd.respond_info("_BOX_SEND_DATA ADDR=%d CMD=%#04x status=%s raw=%s" % (
+            addr, command,
+            hex(response_status) if response_status is not None else "no reply",
+            resp.hex() if resp else "(none)"))
 
     def _reset_pre_loading(self):
         """CLOSE (disable) pre-loading on all 4 slots - a cheap, fast,

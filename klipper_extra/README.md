@@ -103,6 +103,15 @@ then test read-only first:
 CFS_STATUS
 ```
 
+For a lower-level, box.cfg-style workflow, this extra also registers hidden
+underscore-prefixed `_BOX_*` commands with typed parameters for individual
+box-mode, sensor, motor, preloading, staged extrude/retrude, measuring-wheel,
+and raw-data operations. They translate the upstream-style command surface to
+this repository's different, live-validated function IDs and F7/CRC8 framing.
+See [`docs/DIRECT_COMMANDS.md`](../docs/DIRECT_COMMANDS.md) for the full command
+reference and the separately installable `macros/direct_toolchange.cfg`
+workflow. Existing `CFS_RETRUDE` and `CFS_EXTRUDE` behavior is unchanged.
+
 ### Hidden low-level commands
 
 Every function in the extra's `FN` protocol table is also exposed as an
