@@ -1,5 +1,6 @@
 """Behavior tests for the hidden box.cfg-compatible direct G-code API."""
 
+from contextlib import nullcontext
 import os
 import struct
 import sys
@@ -15,6 +16,9 @@ class FakeReactor:
 
     def monotonic(self):
         return 0.0
+
+    def mutex(self):
+        return nullcontext()
 
 
 class FakeGcode:
@@ -157,6 +161,7 @@ def test_hidden_box_commands_are_registered_without_public_aliases(direct_api):
     }
     assert expected <= set(commands)
     assert not {name.removeprefix("_") for name in expected} & set(commands)
+    assert not {"_CFS_%s" % name for name in creality_cfs.FN} & set(commands)
     assert all(
         direct_api[0].gcode.descriptions[name] is None for name in expected)
 

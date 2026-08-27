@@ -112,39 +112,6 @@ See [`docs/DIRECT_COMMANDS.md`](../docs/DIRECT_COMMANDS.md) for the full command
 reference and the separately installable `macros/direct_toolchange.cfg`
 workflow. Existing `CFS_RETRUDE` and `CFS_EXTRUDE` behavior is unchanged.
 
-### Hidden low-level commands
-
-Every function in the extra's `FN` protocol table is also exposed as an
-underscore-prefixed G-code command. These commands intentionally have no
-Klipper `HELP` description, but can be called directly by macros or from the
-console. Replies always include the raw response; established query formats
-also include decoded values.
-
-| Command | Parameters |
-|---|---|
-| `_CFS_GET_RFID` | `SLOT_INDEX=<0-3>` (the RFID index mapping is still unresolved, so this deliberately does not pretend to be A-D) |
-| `_CFS_GET_REMAIN_LEN` | `SLOT_INDEX=<0-3>` |
-| `_CFS_SET_BOX_MODE` | `MODE=<PRINT\|IDLE> [SLOT=<NONE\|A\|B\|C\|D>]` |
-| `_CFS_GET_BUFFER_STATE` | none; decodes `MIDDLE`, `FULL`, or `EMPTY` |
-| `_CFS_CTRL_CONNECTION_MOTOR_ACTION` | `ACTION=<STOP\|EXTRUDE\|RETRUDE>` |
-| `_CFS_GET_FILAMENT_SENSOR_STATE` | `[BANK=<MATERIAL\|CONNECTIONS>]`; defaults to `MATERIAL` and decodes the slot bitmask |
-| `_CFS_GET_BOX_STATE` | none |
-| `_CFS_SET_PRE_LOADING` | `ACTION=<CLOSE\|OPEN\|RUN\|TIGHT> [SLOTS=<ALL\|ABCD>]`; slot letters may be combined, for example `SLOTS=AC` |
-| `_CFS_GET_MEASURING_WHEEL` | none; sends the confirmed `GET` action and decodes millimetres |
-| `_CFS_TIGHTEN_UP_ENABLE` | `ENABLED=<TRUE\|FALSE>` |
-| `_CFS_EXTRUDE_PROCESS` | `SLOT=<A\|B\|C\|D> STAGE=<0-255> [AMOUNT=<0-255>]` |
-| `_CFS_RETRUDE_PROCESS` | `SLOT=<A\|B\|C\|D> STAGE=<0-255>` |
-| `_CFS_GET_VERSION_SN` | none; decodes the ASCII version/serial text |
-| `_CFS_MOVE_DISTANCE` | `DIRECTION=<FORWARD\|REVERSE> DISTANCE=<1-255> [SLOT=<NONE\|A\|B\|C\|D>]` |
-| `_CFS_CMD_SET_SLAVE_ADDR` | `NEW_ADDRESS=<1-253> UID=<12-byte hex UID>`; `:` and `-` separators are accepted |
-| `_CFS_CMD_GET_SLAVE_INFO` | none; broadcasts the discovery request |
-| `_CFS_CMD_ONLINE_CHECK` | none; probes the configured `box_addr` |
-
-The commands which change modes, run motors, or assign an address are raw
-diagnostic operations: they do not perform the sequencing, toolhead safety
-moves, or cleanup provided by `CFS_EXTRUDE` and `CFS_RETRUDE`. Run them only
-under supervision.
-
 If it says "not addressed" (e.g. a genuinely first-ever run with a fresh
 box), try `CFS_RECONNECT`, which now falls back to full broadcast
 discovery automatically. Only move on to `CFS_RETRUDE SLOT=A` /
