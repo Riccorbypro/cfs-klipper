@@ -781,16 +781,17 @@ class CrealityCFS:
                 name, ", ".join(values)))
         return value, values[value]
 
-    def _direct_slot(self, gcmd, name="NUM", default=None, allow_zero=False):
-        value = gcmd.get(name, default)
+    def _direct_slot(self, gcmd, default=None):
+        if gcmd.get("NUM", None) is not None:
+            raise gcmd.error("NUM is no longer supported; use SLOT=A, B, C, or D")
+        value = gcmd.get("SLOT", None)
         if value is None:
-            raise gcmd.error("%s is required" % name)
+            if default is not None:
+                return None, default
+            raise gcmd.error("SLOT is required")
         value = value.upper()
-        if allow_zero and value == "0":
-            return value, 0x00
         if value not in SLOT_BYTES:
-            allowed = "A, B, C, D%s" % (", 0" if allow_zero else "")
-            raise gcmd.error("%s must be one of %s" % (name, allowed))
+            raise gcmd.error("SLOT must be one of A, B, C, D")
         return value, SLOT_BYTES[value]
 
     def _direct_byte(self, gcmd, name, default=None):
@@ -857,9 +858,7 @@ class CrealityCFS:
                           decoder=decode)
 
     def cmd_BOX_GET_RFID(self, gcmd):
-        # NUM remains a raw 0..15 selector because this box firmware's RFID
-        # indexing has not been conclusively mapped to the slot bitmask.
-        num = gcmd.get_int("NUM", 0x0F, minval=0, maxval=15)
+        _, slot = self._direct_slot(gcmd, default=0x0F)
 
         def decode(resp):
             if len(resp) < 7:
@@ -869,17 +868,17 @@ class CrealityCFS:
             except UnicodeDecodeError:
                 return None
 
-        self._direct_send(gcmd, "_BOX_GET_RFID", FN["GET_RFID"], bytes([num]),
+        self._direct_send(gcmd, "_BOX_GET_RFID", FN["GET_RFID"], bytes([slot]),
                           decoder=decode)
 
     def cmd_BOX_GET_REMAIN_LEN(self, gcmd):
-        num = gcmd.get_int("NUM", 0x0F, minval=0, maxval=15)
+        _, slot = self._direct_slot(gcmd, default=0x0F)
 
         def decode(resp):
             return "remain=%s" % resp[5:-1].hex() if len(resp) >= 7 else None
 
         self._direct_send(gcmd, "_BOX_GET_REMAIN_LEN", FN["GET_REMAIN_LEN"],
-                          bytes([num]), decoder=decode)
+                          bytes([slot]), decoder=decode)
 
     def cmd_BOX_GET_BUFFER_STATE(self, gcmd):
         def decode(resp):
@@ -910,30 +909,21 @@ class CrealityCFS:
                           decoder=decode)
 
     def cmd_BOX_SET_BOX_MODE(self, gcmd):
-        _, slot = self._direct_slot(gcmd, default="0", allow_zero=True)
+        _, slot = self._direct_slot(gcmd, default=0x00)
         _, mode = self._direct_enum(
             gcmd, "MODE", {"PRINT": 0x00, "IDLE": 0x01})
         self._direct_send(gcmd, "_BOX_SET_BOX_MODE", FN["SET_BOX_MODE"],
                           bytes([slot, mode]))
 
     def cmd_BOX_SET_PRE_LOADING(self, gcmd):
-        raw_num = gcmd.get("NUM", None)
-        if raw_num is None:
-            num = gcmd.get_int("MASK", 0x0F, minval=0, maxval=15)
-        else:
-            try:
-                num = int(raw_num, 0)
-            except ValueError:
-                raise gcmd.error("NUM must be a slot mask between 0 and 15")
-            if not 0 <= num <= 15:
-                raise gcmd.error("NUM must be a slot mask between 0 and 15")
+        _, slot = self._direct_slot(gcmd, default=0x0F)
         action_name, action = self._direct_enum(
             gcmd, "ACTION", {"CLOSE": 0x00, "OPEN": 0x01,
                               "RUN": 0x02, "TIGHT": 0x03},
             default="CLOSE")
         timeout = 45.0 if action_name in ("RUN", "TIGHT") else 2.0
         self._direct_send(gcmd, "_BOX_SET_PRE_LOADING", FN["SET_PRE_LOADING"],
-                          bytes([num, action]), timeout=timeout)
+                          bytes([slot, action]), timeout=timeout)
 
     def cmd_BOX_CTRL_CONNECTION_MOTOR_ACTION(self, gcmd):
         _, action = self._direct_enum(
@@ -973,7 +963,7 @@ class CrealityCFS:
                           bytes([slot, stage, amount]))
 
     def cmd_BOX_RETRUDE_PROCESS(self, gcmd):
-        _, slot = self._direct_slot(gcmd, default="0", allow_zero=True)
+        _, slot = self._direct_slot(gcmd, default=0x00)
         _, trigger = self._direct_enum(
             gcmd, "TRIGGER", {"BUFFER": 0x00, "MATERIAL": 0x01},
             default="BUFFER")
