@@ -104,6 +104,17 @@ for the full caveat.
    serial: /dev/ttyUSB0
    baud: 230400
    box_addr: 1
+
+   # Required for CFS_EXTRUDE; calibrate all positions on your printer.
+   purge_min_z: <minimum safe bucket travel Z>
+   purge_entry_x: <X safely outside the bucket>
+   purge_entry_y: <Y safely outside the bucket>
+   # Configure one or both axes for the move into the bucket.
+   purge_y: <Y inside the bucket>
+
+   # Optional: purge_z_hop=1, purge_move_speed=1500,
+   # purge_wipe_accel=15000, purge_wipe_speed=12000,
+   # purge_wipe_repetitions=3
    ```
    (Use the exact port `selftest.sh`/`cfs_cli.py` reported in step 1-2.)
 3. Restart Klipper (`RESTART` in the console, or via Fluidd/Mainsail's
