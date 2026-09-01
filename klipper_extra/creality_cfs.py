@@ -36,11 +36,12 @@
 #   purge_entry_x: <safe X outside bucket>
 #   purge_entry_y: <safe Y outside bucket>
 #   purge_y: <Y inside bucket; omit purge_x to retain entry X>
-#   # optional, name of your real toolhead [filament_switch_sensor],
-#   # used by CFS_RETRUDE's tip-form unload sequence:
+#   # Name of your real toolhead [filament_switch_sensor]. Sensor-gated
+#   # CFS_EXTRUDE requires this to resolve; CFS_RETRUDE uses it too:
 #   toolhead_sensor_name: filament_sensor_2
 
 import logging
+import math
 import os
 import struct
 
@@ -215,8 +216,8 @@ class CrealityCFS:
 
         # Name of the real toolhead filament sensor (a plain Klipper
         # [filament_switch_sensor], NOT one of this extra's own virtual
-        # CFS_A..CFS_D sensors) - used by the tip-form unload sequence in
-        # cmd_CFS_RETRUDE to know when it's actually safe to stop.
+        # CFS_A..CFS_D sensors). Loading uses it as the stage-5 completion
+        # signal; tip-form unload uses it to know when it is safe to stop.
         self.toolhead_sensor_name = config.get("toolhead_sensor_name", "filament_sensor_2")
 
         self.ser = None
@@ -224,6 +225,7 @@ class CrealityCFS:
         self._rx_buffer = bytearray()
         self._pending_response = None
         self._pending_match = None
+        self._response_quarantine_until = 0.0
         # The CFS link is half-duplex. Klipper's mutex parks competing
         # greenlets cooperatively, so polling and gcode commands cannot race
         # for the one pending response without blocking the reactor.
@@ -302,6 +304,7 @@ class CrealityCFS:
             "_BOX_MEASURING_WHEEL": self.cmd_BOX_MEASURING_WHEEL,
             "_BOX_TIGHTEN_UP_ENABLE": self.cmd_BOX_TIGHTEN_UP_ENABLE,
             "_BOX_EXTRUDE_PROCESS": self.cmd_BOX_EXTRUDE_PROCESS,
+            "_CFS_EXTRUDE_UNTIL_SENSOR": self.cmd_CFS_EXTRUDE_UNTIL_SENSOR,
             "_BOX_RETRUDE_PROCESS": self.cmd_BOX_RETRUDE_PROCESS,
             "_BOX_MOVE_DISTANCE": self.cmd_BOX_MOVE_DISTANCE,
             "_BOX_SEND_DATA": self.cmd_BOX_SEND_DATA,
@@ -348,6 +351,7 @@ class CrealityCFS:
                 pass
             self.ser = None
         self._rx_buffer = bytearray()
+        self._response_quarantine_until = 0.0
 
     def _pause(self, seconds):
         """Cooperative wait - use instead of a raw time.sleep() anywhere in
@@ -374,6 +378,16 @@ class CrealityCFS:
         # match both address and function.
         match_addr = None if slave_addr in (0xFE, 0xFF) else slave_addr
         with self._bus_lock:
+            quarantine_until = getattr(
+                self, "_response_quarantine_until", 0.0)
+            if quarantine_until > self.reactor.monotonic():
+                # A reply that arrives after its transaction timed out cannot
+                # be correlated with a later request using the same function
+                # code. Keep the bus idle for one extra timeout window so the
+                # reactor can read and discard that late frame while no
+                # transaction is pending.
+                self.reactor.pause(quarantine_until)
+            self._response_quarantine_until = 0.0
             self.ser.reset_input_buffer()
             self._rx_buffer = bytearray()
             completion = self.reactor.completion()
@@ -402,6 +416,10 @@ class CrealityCFS:
                     return b""
                 response = completion.wait(
                     self.reactor.monotonic() + timeout, b"")
+                if not response:
+                    self._response_quarantine_until = max(
+                        self._response_quarantine_until,
+                        self.reactor.monotonic() + timeout)
                 if debug:
                     logging.info(
                         "creality_cfs: RX %s",
@@ -757,6 +775,31 @@ class CrealityCFS:
         self._direct_send(gcmd, "_BOX_EXTRUDE_PROCESS", FN["EXTRUDE_PROCESS"],
                           bytes([slot, stage, amount]))
 
+    def cmd_CFS_EXTRUDE_UNTIL_SENSOR(self, gcmd):
+        _, slot = self._direct_slot(gcmd)
+        sensor_name = gcmd.get("SENSOR", self.toolhead_sensor_name)
+        polls = gcmd.get_int("POLLS", 50, minval=1, maxval=200)
+        delay_ms = gcmd.get_int("DELAY_MS", 400, minval=1, maxval=5000)
+        recovery_x = gcmd.get_float("RECOVERY_X", None)
+        recovery_y = gcmd.get_float("RECOVERY_Y", None)
+        recovery_speed = gcmd.get_float(
+            "RECOVERY_SPEED", None, above=0.0)
+        restore_outer = bool(gcmd.get_int(
+            "RESTORE_OUTER", 0, minval=0, maxval=1))
+        try:
+            self._extrude_until_toolhead_sensor(
+                gcmd, slot, polls, delay_ms / 1000.0,
+                sensor_name=sensor_name)
+        except Exception:
+            cleanup_error = self._cleanup_box_after_load()
+            if cleanup_error is not None:
+                logging.error(
+                    "creality_cfs: cleanup failed after stage-5 sensor "
+                    "timeout: %s", cleanup_error)
+            self._recover_direct_load(
+                recovery_x, recovery_y, recovery_speed, restore_outer)
+            raise
+
     def cmd_BOX_RETRUDE_PROCESS(self, gcmd):
         _, slot = self._direct_slot(gcmd, default=0x00)
         _, trigger = self._direct_enum(
@@ -806,15 +849,17 @@ class CrealityCFS:
         None if the box didn't reply with a valid 4-byte reading - callers
         must handle that (treat as "can't verify", not "definitely 0")."""
         resp = self._send(self.box_addr, 0xFF, FN["GET_MEASURING_WHEEL"], bytes([0x01]))
-        if len(resp) >= 9:
-            return decode_measuring_wheel(resp[5:9])
+        if len(resp) >= 10 and resp[3] == 0x00:
+            value = decode_measuring_wheel(resp[5:9])
+            if value is not None and math.isfinite(value):
+                return value
         return None
 
     def _get_buffer_state(self):
         """Returns the raw buffer_state byte (0=middle, 1=full, 2=empty -
         see docs/PROTOCOL.md), or None if no valid reply."""
         resp = self._send(self.box_addr, 0xFF, FN["GET_BUFFER_STATE"])
-        if len(resp) >= 6:
+        if len(resp) >= 7 and resp[3] == 0x00 and resp[5] in (0, 1, 2):
             return resp[5]
         return None
 
@@ -838,11 +883,15 @@ class CrealityCFS:
         stage 7 and, if that comes back bad, does a toolhead+box retreat
         before the next attempt.
 
-        Returns True if the handoff looks like it succeeded, False
-        otherwise (caller should treat False as "check physically", not
-        as a hard failure - this is a faithful port of decompiled logic,
-        not independently verified byte-for-byte against live hardware
-        yet)."""
+        Returns True if the handoff has positive sensor plus buffer/wheel
+        evidence. False is a hard failure for the wrapped load; it must not
+        enter PRINT mode without that evidence."""
+        if self._toolhead_filament_detected() is not True:
+            gcmd.respond_info(
+                "CFS_EXTRUDE: refusing handoff because the toolhead sensor "
+                "has not confirmed filament")
+            return False
+
         self.gcode.run_script_from_command("M83")
         self.gcode.run_script_from_command("G0 E%.2f F35" % self.prime_e1)
         self._pause(0.3)
@@ -865,15 +914,19 @@ class CrealityCFS:
             new_distance = self._get_measuring_wheel()
             diff_length = None
             if initial_distance is not None and new_distance is not None:
-                diff_length = new_distance - initial_distance
+                diff_length = abs(new_distance - initial_distance)
             gcmd.respond_info(
                 "CFS_EXTRUDE: handoff attempt %d/%d - buffer_state=%s, "
                 "measuring-wheel diff=%s" % (
                     attempt + 1, self.extrude_material_times, buffer_state,
                     ("%.2fmm" % diff_length) if diff_length is not None else "unknown"))
 
-            if buffer_state != 1 and (
-                    diff_length is None or diff_length >= self.extrude_material_len_for_extruder):
+            buffer_released = buffer_state in (0, 2)
+            wheel_moved = (diff_length is not None and
+                           math.isfinite(diff_length) and
+                           diff_length >= self.extrude_material_len_for_extruder)
+            sensor_confirmed = self._toolhead_filament_detected() is True
+            if sensor_confirmed and (buffer_released or wheel_moved):
                 return True
 
             self._send(self.box_addr, 0xFF, FN["SET_BOX_MODE"], bytes([0x00, 0x01]))
@@ -1035,12 +1088,75 @@ class CrealityCFS:
                            "auto-feeds along with it" % (
                                slot_letter, hex(status) if status is not None else "no reply"))
 
-    def _toolhead_filament_detected(self):
+    def _toolhead_filament_detected(self, sensor_name=None):
+        sensor_name = sensor_name or self.toolhead_sensor_name
         sensor = self.printer.lookup_object(
-            "filament_switch_sensor %s" % self.toolhead_sensor_name, None)
+            "filament_switch_sensor %s" % sensor_name, None)
         if sensor is None:
             return None
         return sensor.get_status(self.reactor.monotonic())["filament_detected"]
+
+    def _extrude_until_toolhead_sensor(
+            self, gcmd, slot, polls, delay, sensor_name=None):
+        """Poll stage 5 until the physical toolhead sensor confirms arrival."""
+        sensor_name = sensor_name or self.toolhead_sensor_name
+        sensor = self.printer.lookup_object(
+            "filament_switch_sensor %s" % sensor_name, None)
+        if sensor is None:
+            raise gcmd.error(
+                "CFS_EXTRUDE: toolhead sensor '%s' is not configured" %
+                sensor_name)
+
+        for attempt in range(1, polls + 1):
+            resp = self._send(
+                self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"],
+                bytes([slot, 0x05, 0x00]))
+            status = resp[3] if len(resp) >= 4 else None
+            if status not in (None, 0x00):
+                gcmd.respond_info(
+                    "CFS_EXTRUDE: stage 5 poll %d status=%s; waiting for "
+                    "toolhead sensor" % (attempt, hex(status)))
+            self._pause(delay)
+            if sensor.get_status(
+                    self.reactor.monotonic())["filament_detected"]:
+                gcmd.respond_info(
+                    "CFS_EXTRUDE: toolhead sensor confirmed after %d polls" %
+                    attempt)
+                return attempt
+
+        raise gcmd.error(
+            "CFS_EXTRUDE: toolhead sensor '%s' did not trigger after %d polls" %
+            (sensor_name, polls))
+
+    def _recover_direct_load(
+            self, recovery_x, recovery_y, recovery_speed, restore_outer):
+        """Best-effort bucket retreat and state restore after a direct abort."""
+        if None in (recovery_x, recovery_y, recovery_speed):
+            return
+        try:
+            self.gcode.run_script_from_command("G90")
+            self.gcode.run_script_from_command(
+                "G1 X%.2f Y%.2f F%s" % (
+                    recovery_x, recovery_y,
+                    format_gcode_number(recovery_speed)))
+            self.gcode.run_script_from_command("M400")
+        except Exception:
+            logging.exception(
+                "creality_cfs: direct-load bucket retreat failed")
+        try:
+            self.gcode.run_script_from_command(
+                "RESTORE_GCODE_STATE NAME=CFS_DIRECT_LOAD MOVE=0")
+        except Exception:
+            logging.exception(
+                "creality_cfs: direct-load G-code state restoration failed")
+        if restore_outer:
+            try:
+                self.gcode.run_script_from_command(
+                    "RESTORE_GCODE_STATE NAME=CFS_DIRECT_TOOLCHANGE MOVE=0")
+            except Exception:
+                logging.exception(
+                    "creality_cfs: direct-toolchange G-code state "
+                    "restoration failed")
 
     def _retrude_with_tip_form(self, gcmd):
         # UNTESTED (as of this writing) reimplementation of the real
@@ -1245,17 +1361,14 @@ class CrealityCFS:
                 bytes([slot, 0x04, 0x00]))
             self._pause(0.3)
 
-            for _ in range(polls):
-                self._send(
-                    self.box_addr, 0xFF, FN["EXTRUDE_PROCESS"],
-                    bytes([slot, 0x05, 0x00]))
-                self._pause(0.4)
+            self._extrude_until_toolhead_sensor(
+                gcmd, slot, polls, 0.4)
 
             handoff_ok = self._extrude_material_handoff(gcmd, slot)
             if not handoff_ok:
-                gcmd.respond_info(
-                    "CFS_EXTRUDE: handoff did not confirm success - "
-                    "check physically before printing")
+                raise gcmd.error(
+                    "CFS_EXTRUDE: handoff did not confirm success; refusing "
+                    "to enter print mode")
 
             # Mark this slot as the active PRINT-mode slot after handoff.
             self._send(
@@ -1323,7 +1436,7 @@ class CrealityCFS:
         if slot_letter not in SLOT_BYTES:
             raise gcmd.error("SLOT must be one of A, B, C, D")
         slot = SLOT_BYTES[slot_letter]
-        polls = gcmd.get_int("POLLS", 20, minval=1, maxval=200)
+        polls = gcmd.get_int("POLLS", 50, minval=1, maxval=200)
 
         toolhead = self.printer.lookup_object("toolhead")
         toolhead_status = toolhead.get_status(self.reactor.monotonic())

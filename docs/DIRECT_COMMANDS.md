@@ -85,14 +85,26 @@ The file contains these sections:
 - `_CFS_DIRECT_UNLOAD`: buffer-aware pre-cut retract, cutter movement, and
   material-triggered unload.
 - `_CFS_DIRECT_LOAD`: explicit connection, tension, stages 0/4/5/6/7,
-  toolhead handoff, optional purge, print mode, and a high-acceleration
-  outside-inside-final-out bucket exit.
+  sensor-gated stage-5 feeding, toolhead handoff, optional purge, print mode,
+  and a high-acceleration outside-inside-final-out bucket exit.
 - `_CFS_DIRECT_FINISH`: post-load sensor check and active-slot persistence.
 
 `CFS_DIRECT_CONFIG` ships with every movement coordinate and `minimum_z` set
 to `-1`. Copy the file to the printer's config directory, calibrate every
 value on that printer, and change them there. `CFS_DIRECT_TOOLCHANGE` refuses
 to run while any required value is negative.
+
+`extrude_poll_count` is a safety bound, not a completion signal. Stage 5 now
+runs inside the Python extra until the configured `toolhead_sensor_name`
+actually reports filament, stopping early when it does. The shipped maximum is
+50 polls with a 400 ms pause after each reply; transport timeouts can extend
+the wall-clock limit. If the sensor is missing or remains clear at that bound,
+the extra stops the box motors, returns the box to IDLE, and aborts before
+stages 6/7, print mode, handoff, or purge. Before propagating the error, the
+direct path makes a best-effort move back to the configured outside-bucket
+entry, restores `_CFS_DIRECT_LOAD`'s saved G-code state, and restores the
+public `CFS_DIRECT_TOOLCHANGE` snapshot so a preceding unload cannot leak its
+absolute/relative motion modes into the caller.
 
 Before any cutter or loading-position XY move, the post-home sequence computes:
 
@@ -150,6 +162,7 @@ configuration instead of silently changing slicer behavior.
 5. Only then use `CFS_DIRECT_TOOLCHANGE`, and only add T0-T3 aliases after the
    complete workflow is repeatable.
 
-The extra still performs synchronous serial reads from Klipper's reactor.
-Customising the macro reduces opaque process behavior but does not remove that
-transport limitation.
+The serial protocol has no transaction id to distinguish a late reply from a
+new request using the same function code. After a timeout, the extra therefore
+keeps the bus idle for one additional timeout window so the reactor can discard
+late frames before another request is sent.

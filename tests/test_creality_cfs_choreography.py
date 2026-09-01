@@ -40,14 +40,24 @@ class FakeGCodeMove:
 
 
 class FakeGCmd:
-    def __init__(self):
+    def __init__(self, **params):
+        self.params = {name: str(value) for name, value in params.items()}
         self.responses = []
 
     def get(self, name, default=None):
+        if name in self.params:
+            return self.params[name]
         return "A" if name == "SLOT" else default
 
     def get_int(self, name, default, **kwargs):
+        if name in self.params:
+            return int(self.params[name])
         return 1 if name == "POLLS" else default
+
+    def get_float(self, name, default=None, **kwargs):
+        if name in self.params:
+            return float(self.params[name])
+        return default
 
     def error(self, message):
         return RuntimeError(message)
@@ -78,13 +88,23 @@ def make_command_cfs(gcode_z=35.0):
     cfs.gcode = RecordingGCode(events)
     toolhead = FakeToolhead(z=35.0, gcode_z=gcode_z)
     gcode_move = FakeGCodeMove(gcode_z)
+    toolhead_sensor = SimpleNamespace(
+        get_status=lambda eventtime: {
+            "filament_detected": True,
+            "enabled": True,
+        })
     cfs.reactor = SimpleNamespace(monotonic=lambda: 100.0)
 
-    def lookup_object(name):
-        return {"toolhead": toolhead, "gcode_move": gcode_move}.get(name)
+    def lookup_object(name, default=None):
+        return {
+            "toolhead": toolhead,
+            "gcode_move": gcode_move,
+            "filament_switch_sensor extruder_sensor": toolhead_sensor,
+        }.get(name, default)
 
     cfs.printer = SimpleNamespace(lookup_object=lookup_object)
     cfs.box_addr = 1
+    cfs.toolhead_sensor_name = "extruder_sensor"
     cfs._reset_pre_loading = lambda: None
     cfs._pause = lambda seconds: None
     sent = []
@@ -96,6 +116,203 @@ def make_command_cfs(gcode_z=35.0):
 
     cfs._send = record_send
     return cfs, events, sent
+
+
+class SequenceSensor:
+    def __init__(self, states):
+        self.states = iter(states)
+        self.current = False
+
+    def get_status(self, eventtime):
+        self.current = next(self.states, self.current)
+        return {"filament_detected": self.current, "enabled": True}
+
+
+def make_sensor_gate_cfs(sensor_states):
+    cfs = make_cfs()
+    cfs.box_addr = 1
+    cfs.toolhead_sensor_name = "extruder_sensor"
+    cfs.reactor = SimpleNamespace(monotonic=lambda: 100.0)
+    sensor = SequenceSensor(sensor_states)
+    cfs.printer = SimpleNamespace(
+        lookup_object=lambda name, default=None: (
+            sensor if name == "filament_switch_sensor extruder_sensor" else default))
+    sent = []
+    pauses = []
+    cfs._send = lambda addr, status, function_code, data=b"", **kwargs: (
+        sent.append((function_code, data))
+        or bytes([0xF7, addr, 0x03, 0x00, function_code, 0x00]))
+    cfs._pause = pauses.append
+    cleanup_calls = []
+    cfs._cleanup_box_after_load = lambda: cleanup_calls.append(True) or None
+    return cfs, sent, pauses, cleanup_calls
+
+
+def test_stage_five_polling_stops_when_toolhead_sensor_triggers():
+    """Stage 6 must wait for physical arrival rather than elapsed poll count."""
+    cfs, sent, pauses, cleanup_calls = make_sensor_gate_cfs(
+        [False, False, True])
+
+    polls = cfs._extrude_until_toolhead_sensor(
+        FakeGCmd(), slot=0x01, polls=10, delay=0.4)
+
+    stage_five = [
+        data for function_code, data in sent
+        if function_code == creality_cfs.FN["EXTRUDE_PROCESS"]]
+    assert polls == 3
+    assert stage_five == [bytes([0x01, 0x05, 0x00])] * 3
+    assert pauses == [0.4, 0.4, 0.4]
+    assert cleanup_calls == []
+
+
+def test_stage_five_no_reply_still_requires_sensor_confirmation():
+    """Transport silence must neither confirm arrival nor defeat ground truth."""
+    cfs, sent, pauses, cleanup_calls = make_sensor_gate_cfs([False, True])
+
+    def no_reply(addr, status, function_code, data=b"", **kwargs):
+        sent.append((function_code, data))
+        return b""
+
+    cfs._send = no_reply
+
+    polls = cfs._extrude_until_toolhead_sensor(
+        FakeGCmd(), slot=0x01, polls=10, delay=0.4)
+
+    assert polls == 2
+    assert sent == [
+        (creality_cfs.FN["EXTRUDE_PROCESS"], bytes([0x01, 0x05, 0x00])),
+        (creality_cfs.FN["EXTRUDE_PROCESS"], bytes([0x01, 0x05, 0x00])),
+    ]
+    assert pauses == [0.4, 0.4]
+    assert cleanup_calls == []
+
+
+def test_stage_five_timeout_cleans_up_and_stops_before_handoff():
+    """A clear sensor at the safety bound must abort with box motors stopped."""
+    cfs, sent, pauses, cleanup_calls = make_sensor_gate_cfs([False, False])
+
+    with pytest.raises(RuntimeError, match="did not trigger after 2 polls"):
+        cfs.cmd_CFS_EXTRUDE_UNTIL_SENSOR(FakeGCmd(
+            SLOT="A", SENSOR="extruder_sensor", POLLS=2, DELAY_MS=250))
+
+    assert sent == [
+        (creality_cfs.FN["EXTRUDE_PROCESS"], bytes([0x01, 0x05, 0x00])),
+        (creality_cfs.FN["EXTRUDE_PROCESS"], bytes([0x01, 0x05, 0x00])),
+    ]
+    assert pauses == [0.25, 0.25]
+    assert cleanup_calls == [True]
+
+
+def test_direct_toolchange_load_failure_restores_load_and_outer_states():
+    """A FROM-to-TO failure must undo both load-local and caller mode changes."""
+    cfs, sent, pauses, cleanup_calls = make_sensor_gate_cfs([False])
+
+    with pytest.raises(RuntimeError, match="missing_sensor.*not configured"):
+        cfs.cmd_CFS_EXTRUDE_UNTIL_SENSOR(FakeGCmd(
+            SLOT="A", SENSOR="missing_sensor", POLLS=2, DELAY_MS=250,
+            RECOVERY_X=159, RECOVERY_Y=200, RECOVERY_SPEED=12000,
+            RESTORE_OUTER=1))
+
+    assert sent == []
+    assert pauses == []
+    assert cleanup_calls == [True]
+    assert cfs.gcode.commands == [
+        "G90",
+        "G1 X159.00 Y200.00 F12000",
+        "M400",
+        "RESTORE_GCODE_STATE NAME=CFS_DIRECT_LOAD MOVE=0",
+        "RESTORE_GCODE_STATE NAME=CFS_DIRECT_TOOLCHANGE MOVE=0",
+    ]
+
+
+def test_wrapped_load_uses_sensor_gate_before_handoff():
+    """The wrapped loader must not retain a separate fixed-count stage-5 loop."""
+    cfs, events, sent = make_command_cfs()
+    calls = []
+    cfs._extrude_until_toolhead_sensor = (
+        lambda gcmd, slot, polls, delay, sensor_name=None:
+        calls.append(("sensor", slot, polls, delay)) or 3)
+    cfs._extrude_material_handoff = (
+        lambda gcmd, slot: calls.append(("handoff", slot)) or True)
+
+    assert cfs._load_filament_in_bucket(FakeGCmd(), 0x01, 10)
+
+    assert calls == [
+        ("sensor", 0x01, 10, 0.4),
+        ("handoff", 0x01),
+    ]
+    assert (creality_cfs.FN["EXTRUDE_PROCESS"],
+            bytes([0x01, 0x05, 0x00])) not in sent
+
+
+def test_wrapped_load_aborts_before_print_mode_when_handoff_is_unconfirmed():
+    """A failed handoff must not mark the slot loaded and continue printing."""
+    cfs, events, sent = make_command_cfs()
+    cfs._extrude_until_toolhead_sensor = lambda *args, **kwargs: 1
+    cfs._extrude_material_handoff = lambda gcmd, slot: False
+
+    with pytest.raises(RuntimeError, match="handoff did not confirm"):
+        cfs._load_filament_in_bucket(FakeGCmd(), 0x01, 10)
+
+    assert (creality_cfs.FN["SET_BOX_MODE"],
+            bytes([0x01, 0x00])) not in sent
+    assert (creality_cfs.FN["CTRL_CONNECTION_MOTOR_ACTION"],
+            bytes([0x00])) in sent
+
+
+def make_handoff_cfs():
+    cfs = make_cfs()
+    cfs.box_addr = 1
+    cfs.prime_e1 = 10.0
+    cfs.prime_e2 = 5.0
+    cfs.extrude_material_len_for_extruder = 9.0
+    cfs.extrude_material_times = 1
+    cfs._pause = lambda seconds: None
+    cfs._toolhead_filament_detected = lambda sensor_name=None: True
+    return cfs
+
+
+def test_handoff_does_not_confirm_when_all_box_telemetry_is_unavailable():
+    """Unknown buffer and wheel state must not be treated as positive evidence."""
+    cfs = make_handoff_cfs()
+    cfs._send = lambda *args, **kwargs: b""
+
+    assert not cfs._extrude_material_handoff(FakeGCmd(), 0x01)
+
+
+def test_handoff_accepts_negative_direction_measuring_wheel_travel():
+    """The wheel's documented negative feed direction must use travel magnitude."""
+    cfs = make_handoff_cfs()
+    cfs._send = lambda addr, status, function_code, data=b"", **kwargs: bytes(
+        [0xF7, addr, 0x03, 0x00, function_code, 0x00])
+    distances = iter([-100.0, -110.0])
+    cfs._get_measuring_wheel = lambda: next(distances)
+    cfs._get_buffer_state = lambda: 1
+
+    assert cfs._extrude_material_handoff(FakeGCmd(), 0x01)
+
+
+def test_handoff_rejects_unknown_buffer_value_without_wheel_evidence():
+    """Undefined buffer bytes are telemetry failures, not released states."""
+    cfs = make_handoff_cfs()
+    cfs._send = lambda addr, status, function_code, data=b"", **kwargs: bytes(
+        [0xF7, addr, 0x03, 0x00, function_code, 0x00])
+    cfs._get_measuring_wheel = lambda: None
+    cfs._get_buffer_state = lambda: 0xFF
+
+    assert not cfs._extrude_material_handoff(FakeGCmd(), 0x01)
+
+
+def test_handoff_rejects_non_finite_measuring_wheel_travel():
+    """Infinite wheel readings must not satisfy the minimum travel check."""
+    cfs = make_handoff_cfs()
+    cfs._send = lambda addr, status, function_code, data=b"", **kwargs: bytes(
+        [0xF7, addr, 0x03, 0x00, function_code, 0x00])
+    distances = iter([0.0, float("inf")])
+    cfs._get_measuring_wheel = lambda: next(distances)
+    cfs._get_buffer_state = lambda: 1
+
+    assert not cfs._extrude_material_handoff(FakeGCmd(), 0x01)
 
 
 def test_bucket_entry_raises_low_toolhead_to_minimum_before_xy_travel():

@@ -22,8 +22,8 @@ def _load_template(section):
     return env.from_string(parser.get(section, "gcode"))
 
 
-def test_direct_load_renders_named_stages_and_configured_poll_count():
-    """Replacing named direct stages with a wrapped load breaks custom control."""
+def test_direct_load_waits_for_runtime_sensor_before_stage_six():
+    """A fixed rendered poll loop can advance before filament reaches the toolhead."""
     template = _load_template("gcode_macro _CFS_DIRECT_LOAD")
     config = SimpleNamespace(
         extrude_x=159.0,
@@ -43,6 +43,7 @@ def test_direct_load_renders_named_stages_and_configured_poll_count():
         purge_wipe_speed=12000.0,
         purge_wipe_repetitions=3,
         retreat_y=200.0,
+        toolhead_sensor_name="extruder_sensor",
     )
     rendered = template.render(
         params={"TO": "C", "SAFE_Z": "82.0"},
@@ -58,7 +59,18 @@ def test_direct_load_renders_named_stages_and_configured_poll_count():
     assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=0 AMOUNT=0" in rendered
     assert "G1 Z82.0 F1500.0" in rendered
     assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=4 AMOUNT=0" in rendered
-    assert rendered.count("_BOX_EXTRUDE_PROCESS SLOT=C STAGE=5 AMOUNT=0") == 3
+    wait_command = (
+        "_CFS_EXTRUDE_UNTIL_SENSOR SLOT=C SENSOR=extruder_sensor "
+        "POLLS=3 DELAY_MS=400 RECOVERY_X=159.0 RECOVERY_Y=200.0 "
+        "RECOVERY_SPEED=12000.0 RESTORE_OUTER=1")
+    assert wait_command in rendered
+    assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=5 AMOUNT=0" not in rendered
+    assert rendered.index(wait_command) < rendered.index(
+        "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=6 AMOUNT=0")
+    assert rendered.index("SAVE_GCODE_STATE NAME=CFS_DIRECT_LOAD") < (
+        rendered.index(wait_command))
+    assert rendered.index("RESTORE_GCODE_STATE NAME=CFS_DIRECT_LOAD MOVE=0") > (
+        rendered.rindex("G1 X159.0 Y200.0 F12000.0"))
     assert "_BOX_EXTRUDE_PROCESS SLOT=C STAGE=7 AMOUNT=3" in rendered
     assert "_BOX_SET_BOX_MODE SLOT=C MODE=PRINT" in rendered
 
@@ -84,6 +96,7 @@ def test_direct_load_heats_to_requested_temperature_when_already_hot():
         purge_wipe_accel=15000.0,
         purge_wipe_speed=12000.0,
         purge_wipe_repetitions=3,
+        toolhead_sensor_name="extruder_sensor",
     )
     rendered = template.render(
         params={"TO": "C", "TEMP": "260", "SAFE_Z": "82.0"},
@@ -150,6 +163,7 @@ def test_direct_load_uses_choreographed_bucket_exit_and_restores_acceleration():
         purge_wipe_accel=15000.0,
         purge_wipe_speed=12000.0,
         purge_wipe_repetitions=3,
+        toolhead_sensor_name="extruder_sensor",
     )
     rendered = template.render(
         params={"TO": "C", "TEMP": "260", "SAFE_Z": "82.0"},
@@ -276,6 +290,7 @@ def test_direct_load_stops_before_box_motion_when_hotend_is_cold():
         purge_wipe_speed=12000.0,
         purge_wipe_repetitions=3,
         retreat_y=200.0,
+        toolhead_sensor_name="extruder_sensor",
     )
     rendered = template.render(
         params={"TO": "A", "TEMP": "0", "SAFE_Z": "52.0"},
