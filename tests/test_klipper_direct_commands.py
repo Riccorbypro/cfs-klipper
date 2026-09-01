@@ -156,6 +156,7 @@ def test_hidden_box_commands_are_registered_without_public_aliases(direct_api):
         "_BOX_MEASURING_WHEEL",
         "_BOX_TIGHTEN_UP_ENABLE",
         "_BOX_EXTRUDE_PROCESS",
+        "_CFS_EXTRUDE_UNTIL_SENSOR",
         "_BOX_RETRUDE_PROCESS",
         "_BOX_MOVE_DISTANCE",
         "_BOX_SEND_DATA",

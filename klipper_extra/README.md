@@ -88,6 +88,9 @@ purge_entry_y: <Y safely outside the bucket>
 # Configure one or both axes for the move from the entry point into the bucket.
 purge_y: <Y inside the bucket>
 
+# Name of the real toolhead filament switch used to confirm load/unload.
+toolhead_sensor_name: filament_sensor_2
+
 # Optional motion tuning defaults:
 # purge_z_hop: 1
 # purge_move_speed: 1500
@@ -110,7 +113,10 @@ and raw-data operations. They translate the upstream-style command surface to
 this repository's different, live-validated function IDs and F7/CRC8 framing.
 See [`docs/DIRECT_COMMANDS.md`](../docs/DIRECT_COMMANDS.md) for the full command
 reference and the separately installable `macros/direct_toolchange.cfg`
-workflow. Existing `CFS_RETRUDE` and `CFS_EXTRUDE` behavior is unchanged.
+workflow. Both direct loading and `CFS_EXTRUDE` now keep stage 5 running until
+the real toolhead sensor confirms arrival, with `POLLS` as a bounded failure
+limit rather than a completion count. `CFS_EXTRUDE` also refuses to enter
+PRINT mode unless its buffer/measuring-wheel handoff check confirms success.
 
 If it says "not addressed" (e.g. a genuinely first-ever run with a fresh
 box), try `CFS_RECONNECT`, which now falls back to full broadcast
@@ -122,11 +128,12 @@ printer.
 (2026-08-16) - full tip-form unload sequence, ended with "toolhead sensor
 clear, unload complete" and "confirmed clear", no manual assist needed.
 
-**`CFS_EXTRUDE` ✅ confirmed working as a real Klipper extra command too**
-(2026-08-16) - `CFS_EXTRUDE SLOT=B` completed cleanly ("CFS_EXTRUDE
-slot=B complete (20 polls)"), a genuine slot switch through the actual
-gcode command path. Getting there took finding and fixing two real
-problems live:
+**`CFS_EXTRUDE` ✅ was confirmed working as a real Klipper extra command**
+(2026-08-16) - `CFS_EXTRUDE SLOT=B` completed cleanly under the old fixed
+20-poll behavior, a genuine slot switch through the actual gcode command path.
+The current sensor-gated stage-5 behavior is regression-tested in the
+repository but still needs supervised live confirmation. Getting the original
+command working took finding and fixing two real problems live:
 
 1. **A reactor-stall heater fault.** This extra's accumulated
    `time.sleep()` calls and blocking serial reads

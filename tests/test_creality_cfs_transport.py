@@ -17,6 +17,9 @@ class FakeCompletion:
     def wait(self, deadline, default=None):
         if self.reactor is not None and self.reactor.on_wait is not None:
             self.reactor.on_wait()
+        if (self.reactor is not None and not self.completed
+                and hasattr(self.reactor, "now")):
+            self.reactor.now = deadline
         return self.value if self.completed else default
 
     def test(self):
@@ -42,12 +45,21 @@ class FakeMutex(AbstractContextManager):
 class FakeReactor:
     def __init__(self):
         self.on_wait = None
+        self.on_pause = None
+        self.now = 100.0
+        self.pause_deadlines = []
         self.mutex_instance = FakeMutex()
         self.registered = []
         self.unregistered = []
 
     def monotonic(self):
-        return 100.0
+        return self.now
+
+    def pause(self, deadline):
+        self.pause_deadlines.append(deadline)
+        if self.on_pause is not None:
+            self.on_pause()
+        self.now = deadline
 
     def completion(self):
         return FakeCompletion(self)
@@ -151,6 +163,30 @@ def test_send_reads_only_from_reactor_fd_callback(monkeypatch):
             0x01, 0xFF, creality_cfs.FN["GET_BOX_STATE"]))]
     assert serial_port.writes == []
     assert cfs.reactor.mutex_instance.entries == 1
+
+
+def test_timeout_quarantines_late_reply_before_next_same_function_send(
+        monkeypatch):
+    """A late stage-5 reply must not complete the next EXTRUDE_PROCESS call."""
+    serial_port = FakeSerial()
+    cfs = make_transport(serial_port)
+    install_raw_write(monkeypatch)
+    function_code = creality_cfs.FN["EXTRUDE_PROCESS"]
+
+    assert cfs._send(0x01, 0xFF, function_code, timeout=0.25) == b""
+
+    late = creality_cfs.build_frame(
+        0x01, 0x00, function_code, b"late-stage-5")
+    current = creality_cfs.build_frame(
+        0x01, 0x00, function_code, b"current-stage-6")
+
+    cfs.reactor.on_pause = lambda: cfs._dispatch_serial_frame(late)
+    cfs.reactor.on_wait = lambda: cfs._dispatch_serial_frame(current)
+
+    received = cfs._send(0x01, 0xFF, function_code, timeout=0.25)
+
+    assert received == current
+    assert cfs.reactor.pause_deadlines == [100.5]
 
 
 def test_serial_callback_assembles_a_frame_across_partial_reads():
